@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .browser import Browser, StalePage
 from .model import action_space, choose, field_context, field_text
-from .questions import MAX_STEPS
+from .questions import MAX_MODEL_CALLS, MAX_STEPS
 
 
 class Agent:
@@ -75,8 +75,8 @@ class Agent:
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
-            if len(state["decisions"]) >= MAX_STEPS * 2:
-                raise ValueError("Reached the demo's model-call budget")
+            if len(state["decisions"]) >= MAX_MODEL_CALLS:
+                raise ValueError(f"Reached the {MAX_MODEL_CALLS}-call model budget (JEV_MAX_MODEL_CALLS)")
             state["decision"] = choose(state["page"], state["goal"], state["history"])
             state["decisions"].append(
                 {
@@ -104,7 +104,7 @@ class Agent:
             action = next(a for a in page["actions"] if a["id"] == selected)
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
-                raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
+                raise ValueError(f"Stopped at the {MAX_STEPS}-action budget (JEV_MAX_STEPS)")
             text, helper = None, None
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
