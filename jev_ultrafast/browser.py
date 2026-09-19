@@ -33,7 +33,15 @@ class Browser:
         self._apply_viewport(viewport)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.call("Page.navigate", url=url)
+        # No url means "carry on from whatever this tab is showing".
+        #
+        # Chaining runs otherwise defeats itself: the second one navigates to the
+        # same address and throws away the state the first one just built — a
+        # filter cleared, a dialog opened, a row selected. The control under test
+        # frequently does not exist until that state is there, so re-navigating
+        # guarantees the run cannot find it.
+        if url:
+            self.call("Page.navigate", url=url)
         self.wait_until_settled()
 
     def _apply_viewport(self, viewport):

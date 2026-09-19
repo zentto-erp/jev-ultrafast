@@ -162,3 +162,18 @@ def test_unusable_window_size_clears_the_override(monkeypatch):
 
     Browser("https://example.test/", viewport="window")
     assert any(m == "Emulation.clearDeviceMetricsOverride" for m, _ in recorder.calls)
+
+
+def test_no_url_keeps_the_tab_where_it_is(fake):
+    """Chaining runs otherwise defeats itself: navigating again throws away the
+    state the previous run just built, and the control under test often does not
+    exist until that state is there."""
+    Browser("", reuse_target="existing-tab")
+    assert not [p for m, p in fake.calls if m == "Page.navigate"]
+
+
+def test_a_url_still_navigates_when_reusing(fake):
+    """Reuse must not mean "never navigate": a run that names a URL goes there."""
+    Browser("https://example.test/otra", reuse_target="existing-tab")
+    navigations = [p for m, p in fake.calls if m == "Page.navigate"]
+    assert navigations and navigations[0]["url"] == "https://example.test/otra"
