@@ -264,7 +264,23 @@ def browser_operation(request):
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
               const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
               if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
+              // elementFromPoint stops at the shadow boundary and returns the
+              // component HOST, so `e.contains(hit)` is false for anything
+              // inside it and the action is discarded as unreachable. The agent
+              // then picks the same control again, forever: that is the loop.
+              // Descending through open roots asks the real question — is the
+              // thing under the cursor this element, or inside it?
+              const deepHit=(px,py)=>{
+                let node=document.elementFromPoint(px,py);
+                while (node?.shadowRoot) {
+                  const inner=node.shadowRoot.elementFromPoint(px,py);
+                  if (!inner || inner===node) break;
+                  node=inner;
+                }
+                return node;
+              };
+              const hit=deepHit(x,y);
+              if (!(hit===e || e.contains(hit) || hit?.contains(e))) return null;
               if (action.kind==='select') {
                 if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
                     !o.disabled && !o.closest('optgroup[disabled]'))) return null;
