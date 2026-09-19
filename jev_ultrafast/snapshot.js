@@ -84,7 +84,29 @@
     const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
     if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
-    const base={node:identity(e),role:rname,label:name(e)||rname,
+    // A control inside a row needs the row to be nameable. A grid of 122 rows
+    // offers 122 controls all called "checkbox": indistinguishable, so the
+    // model cannot pick "the one on the first row" and stalls. Screen readers
+    // hit the same wall, so borrowing the row's own text is the same fix.
+    let label=name(e)||rname;
+    const generic=!name(e) || ['checkbox','radio','button','gridcell'].includes(label.toLowerCase());
+    if (generic) {
+      const row=e.closest('tr,[role="row"]');
+      if (row) {
+        // A control in the header row acts on EVERY row. Left looking like the
+        // others, "select the first row" ticks select-all instead: observed on
+        // a 122-row picker, where it selected all 122.
+        const header=!!e.closest('thead,[role="rowgroup"][class*="head" i]') ||
+          !!row.querySelector('th,[role="columnheader"]');
+        if (header) {
+          label=label+' (todas las filas)';
+        } else {
+          const own=(row.innerText||'').replace(/\s+/g,' ').trim().slice(0,60);
+          if (own) label=label+' — '+own;
+        }
+      }
+    }
+    const base={node:identity(e),role:rname,label,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
