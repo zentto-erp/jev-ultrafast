@@ -42,7 +42,7 @@
     return null;
   };
   cache.pageKey=()=>[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    [...document.querySelectorAll('input,textarea,select')].filter(safe)
+    crossRoots('input,textarea,select').filter(safe)
       .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
@@ -52,8 +52,34 @@
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
   };
+  // Web components keep their content in a shadow root, and
+  // document.querySelectorAll does not cross that boundary. On an app built
+  // from them the agent sees an empty page: measured on a data grid, 0 rows
+  // visible where the DOM had 13. It cannot click what it cannot see.
+  const crossRoots=(selector)=>{
+    const found=[], seen=new Set();
+    const walk=(root)=>{
+      if (!root || seen.has(root)) return;
+      seen.add(root);
+      for (const e of root.querySelectorAll(selector)) found.push(e);
+      // Only open roots are reachable; a closed one is deliberately private.
+      for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+    };
+    walk(document);
+    return found;
+  };
+  const textRoots=()=>{
+    const roots=[document.body], seen=new Set();
+    const walk=(root)=>{
+      if (!root || seen.has(root)) return;
+      seen.add(root);
+      for (const e of root.querySelectorAll('*')) if (e.shadowRoot) { roots.push(e.shadowRoot); walk(e.shadowRoot); }
+    };
+    walk(document);
+    return roots;
+  };
   const actions=[];
-  for (const e of document.querySelectorAll(selector)) {
+  for (const e of crossRoots(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
     const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
     if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
@@ -79,9 +105,10 @@
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
   }
-  const words=[], walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
-  const range=document.createRange(); let node,length=0;
-  while ((node=walker.nextNode()) && length<6000) {
+  const words=[]; const range=document.createRange(); let node,length=0;
+  const walkers=textRoots().map(r=>document.createTreeWalker(r,NodeFilter.SHOW_TEXT));
+  const nextText=()=>{ while (walkers.length) { const n=walkers[0].nextNode(); if (n) return n; walkers.shift(); } return null; };
+  while ((node=nextText()) && length<6000) {
     const value=node.textContent.trim(), parent=node.parentElement;
     if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
     range.selectNodeContents(node); const r=range.getBoundingClientRect();
