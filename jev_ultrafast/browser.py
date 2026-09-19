@@ -188,6 +188,15 @@ class Browser:
                 )
             except RuntimeError:
                 pass
+            # Esos 50 ms y dos frames bastan en una web ligera y no en una que
+            # monta un dialogo con una tabla entera al pulsar un boton: se
+            # observa a mitad del montaje, la decision sale sobre una pagina que
+            # ya cambio, y el paso se repite hasta agotarse. Esperar a que el DOM
+            # se quede quieto cuesta unas decimas y quita esa variabilidad.
+            try:
+                self.wait_until_settled(timeout=5, quiet_for=0.25)
+            except Exception:
+                pass
         for attempt in range(10):
             try:
                 return browser_operation(
