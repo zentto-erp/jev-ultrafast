@@ -194,8 +194,7 @@ def test_a_minimized_window_is_restored_before_capturing(monkeypatch):
     monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
     monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
 
-    b = Browser("https://example.test/")
-    b.ensure_composited()
+    Browser("https://example.test/")
     restores = [p for m, p in recorder.calls if m == "Browser.setWindowBounds"]
     assert restores and restores[0]["bounds"]["windowState"] == "normal"
 
@@ -214,6 +213,12 @@ def test_a_visible_window_is_left_alone(monkeypatch):
     monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
     monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
 
-    b = Browser("https://example.test/")
-    b.ensure_composited()
+    Browser("https://example.test/")
     assert not [m for m, _ in recorder.calls if m == "Browser.setWindowBounds"]
+
+
+def test_the_page_is_brought_to_front_on_attach(fake):
+    """A covered window reports `maximized` and still cannot paint, so the
+    window state alone is not enough to keep captures working."""
+    Browser("https://example.test/")
+    assert [m for m, _ in fake.calls if m == "Page.bringToFront"]

@@ -42,31 +42,45 @@ class Browser:
         # guarantees the run cannot find it.
         if url:
             self.call("Page.navigate", url=url)
+        # Antes del primer observe: ese observe ya captura, y una ventana que no
+        # se dibuja cuelga la captura.
+        self.ensure_composited()
         self.wait_until_settled()
 
     def ensure_composited(self):
         """Make sure the window can paint, or screenshots hang.
 
-        Chrome stops compositing a minimized window, and `Page.captureScreenshot`
-        then never returns — the harness reports it as a daemon timeout, which
-        points at the wrong thing entirely. It looks like flakiness that gets
-        worse over a long run, because the longer a run lasts the likelier
-        someone minimized the window or it fell behind another one.
+        Chrome stops compositing a window it is not drawing, and
+        `Page.captureScreenshot` then never returns. The harness reports that as
+        "timed out waiting for the daemon", which points at the wrong thing: the
+        daemon is fine, the window cannot paint.
 
-        Restoring it through CDP keeps this working the same on every platform,
-        and costs one call.
+        It reads like flakiness that worsens over a long session, and the reason
+        is mundane — the longer a run lasts, the likelier the window ended up
+        minimized or behind another one. Measured on about:blank:
+        `Runtime.evaluate` answered in 0.0s while the capture timed out every
+        time; with the window drawn again, the same capture took 0.1s.
+
+        `windowState` alone is not enough: a window can report `maximized` and
+        still be fully covered. `Page.bringToFront` is what actually guarantees
+        it, so it runs once when the page is attached rather than on every
+        observation — enough to keep captures working, without yanking focus
+        away from whoever is watching on every step.
         """
         try:
             window = cdp("Browser.getWindowForTarget", targetId=self.target)
+            if window.get("bounds", {}).get("windowState") == "minimized":
+                cdp(
+                    "Browser.setWindowBounds",
+                    windowId=window["windowId"],
+                    bounds={"windowState": "normal"},
+                )
         except Exception:
-            return  # Not every target has a window (headless, some embedders).
-        if window.get("bounds", {}).get("windowState") != "minimized":
-            return
-        cdp(
-            "Browser.setWindowBounds",
-            windowId=window["windowId"],
-            bounds={"windowState": "normal"},
-        )
+            pass  # Not every target has a window (headless, some embedders).
+        try:
+            self.call("Page.bringToFront")
+        except Exception:
+            pass
 
     def _apply_viewport(self, viewport):
         """Fixed 1120x780, or the window the person is actually looking at.
@@ -142,10 +156,6 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
-        if screenshot:
-            # A minimized window does not composite, and the capture below would
-            # hang until the harness gives up.
-            self.ensure_composited()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
