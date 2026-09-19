@@ -18,19 +18,55 @@ class StalePage(ValueError):
 
 
 class Browser:
-    def __init__(self, url):
+    def __init__(self, url, *, reuse_target=None):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        # A fresh background tab per run is right for benchmarks: runs stay
+        # isolated and the user's Chrome never steals focus. It is wrong when a
+        # person is watching a sequence of runs, because every run opens another
+        # tab and whatever they were looking at is no longer where the work
+        # happens. `reuse_target` drives the existing tab instead.
+        self.target = reuse_target or cdp(
+            "Target.createTarget", url="about:blank", background=True
+        )["targetId"]
+        self.owns_target = reuse_target is None
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         self.call("Page.navigate", url=url)
-        deadline = time.monotonic() + 15
+        self.wait_until_settled()
+
+    def wait_until_settled(self, timeout=15, quiet_for=0.4):
+        """Wait for the document to load AND for the DOM to stop changing.
+
+        `readyState == "complete"` fires when the document and its subresources
+        are done, which on a single-page app is before the first render that
+        carries data: the framework has only just been handed control. Observing
+        there returns the empty shell, so an assertion reads a page the user
+        never saw and a run reports a failure the application does not have.
+
+        Waiting for a short quiet period in the DOM costs a few hundred
+        milliseconds and removes that whole class of false negative.
+        """
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.evaluate("document.readyState") == "complete":
                 break
             time.sleep(0.02)
+
+        last, stable_since = None, None
+        while time.monotonic() < deadline:
+            # Length is a cheap proxy for "the DOM changed". A real mutation
+            # observer would need an injected script surviving navigations, for
+            # a signal no better at deciding when to look.
+            size = self.evaluate("document.body ? document.body.innerHTML.length : 0")
+            now = time.monotonic()
+            if size == last and size:
+                if stable_since and now - stable_since >= quiet_for:
+                    return
+            else:
+                last, stable_since = size, now
+            time.sleep(0.05)
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
@@ -107,9 +143,11 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
+        # A borrowed tab is not ours to close: the caller is reusing it across
+        # runs, and closing it would defeat the reason for lending it.
+        if self.target and self.owns_target:
             cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        self.target = None
 
 
 def fingerprint(state):
