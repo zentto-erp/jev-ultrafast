@@ -44,6 +44,30 @@ class Browser:
             self.call("Page.navigate", url=url)
         self.wait_until_settled()
 
+    def ensure_composited(self):
+        """Make sure the window can paint, or screenshots hang.
+
+        Chrome stops compositing a minimized window, and `Page.captureScreenshot`
+        then never returns — the harness reports it as a daemon timeout, which
+        points at the wrong thing entirely. It looks like flakiness that gets
+        worse over a long run, because the longer a run lasts the likelier
+        someone minimized the window or it fell behind another one.
+
+        Restoring it through CDP keeps this working the same on every platform,
+        and costs one call.
+        """
+        try:
+            window = cdp("Browser.getWindowForTarget", targetId=self.target)
+        except Exception:
+            return  # Not every target has a window (headless, some embedders).
+        if window.get("bounds", {}).get("windowState") != "minimized":
+            return
+        cdp(
+            "Browser.setWindowBounds",
+            windowId=window["windowId"],
+            bounds={"windowState": "normal"},
+        )
+
     def _apply_viewport(self, viewport):
         """Fixed 1120x780, or the window the person is actually looking at.
 
@@ -118,6 +142,10 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        if screenshot:
+            # A minimized window does not composite, and the capture below would
+            # hang until the harness gives up.
+            self.ensure_composited()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.

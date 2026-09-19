@@ -177,3 +177,43 @@ def test_a_url_still_navigates_when_reusing(fake):
     Browser("https://example.test/otra", reuse_target="existing-tab")
     navigations = [p for m, p in fake.calls if m == "Page.navigate"]
     assert navigations and navigations[0]["url"] == "https://example.test/otra"
+
+
+def test_a_minimized_window_is_restored_before_capturing(monkeypatch):
+    """Chrome stops compositing a minimized window and the capture never
+    returns — reported as a daemon timeout, which points at the wrong thing."""
+    recorder = FakeCdp()
+
+    def answer(method, **params):
+        if method == "Browser.getWindowForTarget":
+            recorder.calls.append((method, params))
+            return {"windowId": 7, "bounds": {"windowState": "minimized"}}
+        return FakeCdp.__call__(recorder, method, **params)
+
+    monkeypatch.setattr(browser_mod, "cdp", answer)
+    monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
+
+    b = Browser("https://example.test/")
+    b.ensure_composited()
+    restores = [p for m, p in recorder.calls if m == "Browser.setWindowBounds"]
+    assert restores and restores[0]["bounds"]["windowState"] == "normal"
+
+
+def test_a_visible_window_is_left_alone(monkeypatch):
+    """Stealing focus from someone watching would be worse than the bug."""
+    recorder = FakeCdp()
+
+    def answer(method, **params):
+        if method == "Browser.getWindowForTarget":
+            recorder.calls.append((method, params))
+            return {"windowId": 7, "bounds": {"windowState": "maximized"}}
+        return FakeCdp.__call__(recorder, method, **params)
+
+    monkeypatch.setattr(browser_mod, "cdp", answer)
+    monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
+
+    b = Browser("https://example.test/")
+    b.ensure_composited()
+    assert not [m for m, _ in recorder.calls if m == "Browser.setWindowBounds"]
