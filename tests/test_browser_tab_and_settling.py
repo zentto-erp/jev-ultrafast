@@ -119,3 +119,46 @@ def test_an_empty_body_never_counts_as_settled(monkeypatch):
         if m == "Runtime.evaluate" and "innerHTML.length" in p.get("expression", "")
     ]
     assert len(reads) > 5
+
+
+def test_viewport_is_pinned_by_default(fake):
+    """Benchmarks need comparable runs, so the default must not change."""
+    Browser("https://example.test/")
+    overrides = [p for m, p in fake.calls if m == "Emulation.setDeviceMetricsOverride"]
+    assert overrides and overrides[0]["width"] == 1120 and overrides[0]["height"] == 780
+
+
+def test_viewport_can_follow_the_real_window(monkeypatch):
+    """Watching a wide window at 1120px hides what the layout does at its real
+    width, so a run cannot find a problem that only appears there."""
+    recorder = FakeCdp()
+
+    def answer(method, **params):
+        if method == "Runtime.evaluate" and "innerWidth" in params.get("expression", ""):
+            return {"result": {"value": [1920, 1040]}}
+        return FakeCdp.__call__(recorder, method, **params)
+
+    monkeypatch.setattr(browser_mod, "cdp", answer)
+    monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
+
+    Browser("https://example.test/", viewport="window")
+    overrides = [p for m, p in recorder.calls if m == "Emulation.setDeviceMetricsOverride"]
+    assert overrides and overrides[0]["width"] == 1920 and overrides[0]["height"] == 1040
+
+
+def test_unusable_window_size_clears_the_override(monkeypatch):
+    """Zero is not a size: emulating it would blank the page."""
+    recorder = FakeCdp()
+
+    def answer(method, **params):
+        if method == "Runtime.evaluate" and "innerWidth" in params.get("expression", ""):
+            return {"result": {"value": [0, 0]}}
+        return FakeCdp.__call__(recorder, method, **params)
+
+    monkeypatch.setattr(browser_mod, "cdp", answer)
+    monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
+
+    Browser("https://example.test/", viewport="window")
+    assert any(m == "Emulation.clearDeviceMetricsOverride" for m, _ in recorder.calls)

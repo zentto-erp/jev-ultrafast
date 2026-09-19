@@ -18,7 +18,7 @@ class StalePage(ValueError):
 
 
 class Browser:
-    def __init__(self, url, *, reuse_target=None):
+    def __init__(self, url, *, reuse_target=None, viewport="fixed"):
         ensure_daemon()
         # A fresh background tab per run is right for benchmarks: runs stay
         # isolated and the user's Chrome never steals focus. It is wrong when a
@@ -30,11 +30,43 @@ class Browser:
         )["targetId"]
         self.owns_target = reuse_target is None
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        self._apply_viewport(viewport)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         self.call("Page.navigate", url=url)
         self.wait_until_settled()
+
+    def _apply_viewport(self, viewport):
+        """Fixed 1120x780, or the window the person is actually looking at.
+
+        A pinned viewport makes benchmark runs comparable, and that is why it is
+        the default. But when someone is watching, it leaves most of a wide
+        window blank and — worse — hides what a responsive layout does at the
+        real width: a table that only shows its last columns above 1400px is
+        never seen, so the run cannot find a problem there.
+
+        "window" measures the tab and matches the override to it.
+        """
+        if viewport == "window":
+            size = self.evaluate(
+                "(() => [window.innerWidth || 0, window.innerHeight || 0])()"
+            )
+            if isinstance(size, list) and len(size) == 2 and all(size):
+                width, height = int(size[0]), int(size[1])
+                # An override of 0 disables emulation entirely, which is what we
+                # want if the tab could not report a usable size.
+                self.call(
+                    "Emulation.setDeviceMetricsOverride",
+                    width=width, height=height, deviceScaleFactor=1, mobile=False,
+                )
+                return
+            self.call("Emulation.clearDeviceMetricsOverride")
+            return
+
+        self.call(
+            "Emulation.setDeviceMetricsOverride",
+            width=1120, height=780, deviceScaleFactor=1, mobile=False,
+        )
 
     def wait_until_settled(self, timeout=15, quiet_for=0.4):
         """Wait for the document to load AND for the DOM to stop changing.

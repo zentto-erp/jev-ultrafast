@@ -10,7 +10,7 @@ from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False, reuse_target=None):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, reuse_target=None, viewport="fixed"):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
@@ -19,7 +19,7 @@ class Agent:
         # `reuse_target` drives an existing tab instead of opening one, for when
         # a person is watching several runs in a row and the work should stay
         # where they are looking.
-        self.browser = Browser(url, reuse_target=reuse_target)
+        self.browser = Browser(url, reuse_target=reuse_target, viewport=viewport)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
