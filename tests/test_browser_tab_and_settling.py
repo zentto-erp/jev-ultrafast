@@ -222,3 +222,10 @@ def test_the_page_is_brought_to_front_on_attach(fake):
     window state alone is not enough to keep captures working."""
     Browser("https://example.test/")
     assert [m for m, _ in fake.calls if m == "Page.bringToFront"]
+
+
+def test_viewport_none_leaves_the_page_alone(fake):
+    """Driving a page someone else records must not resize it: the override
+    would change what the recording shows."""
+    Browser("https://example.test/", viewport="none")
+    assert not [m for m, _ in fake.calls if m.startswith("Emulation.setDeviceMetrics")]

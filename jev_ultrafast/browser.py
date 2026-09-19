@@ -92,7 +92,12 @@ class Browser:
         never seen, so the run cannot find a problem there.
 
         "window" measures the tab and matches the override to it.
+        A page being driven on someone else's behalf — recorded, shared, or
+        mid-workflow — should keep the size its owner set: "none" leaves it
+        alone. Overriding it there would change what the recording shows.
         """
+        if viewport in (None, "none"):
+            return
         if viewport == "window":
             size = self.evaluate(
                 "(() => [window.innerWidth || 0, window.innerHeight || 0])()"
