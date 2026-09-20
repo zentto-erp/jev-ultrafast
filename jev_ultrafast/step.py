@@ -40,6 +40,20 @@ def find(page, text, kind=None):
     partial = [a for a in candidates if wanted in (a.get("label") or "").lower()]
     hits = exact or partial
     if not hits:
+        # The control may be perfectly usable and simply not clickable from
+        # here: scrolled out of the viewport, or behind a toolbar that collapses
+        # at this width. If the screen publishes a key for it, that key works
+        # regardless — it needs no rectangle — so saying so turns a dead end
+        # into the next step instead of a failed run.
+        shortcut = [k for k in page.get("keys", [])
+                    if wanted in (k.get("label") or "").lower() and not k.get("disabled")]
+        if shortcut:
+            raise SystemExit(json.dumps({
+                "error": "not_clickable",
+                "message": f"{shortcut[0]['label']!r} is not reachable as a control here, "
+                           f"but the screen binds {shortcut[0]['key']} to it — press the key instead",
+                "key": shortcut[0]["key"],
+            }))
         blocked = [b["label"] for b in page.get("blocked", [])
                    if wanted in (b.get("label") or "").lower()]
         if blocked:
@@ -60,8 +74,9 @@ def find(page, text, kind=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="jev-step", description=__doc__)
     parser.add_argument("operation", choices=[
-        "observe", "click", "dblclick", "fill", "inspect", "listen", "heard",
+        "observe", "keys", "click", "dblclick", "fill", "inspect", "listen", "heard",
         "component", "hold", "hover", "drag", "contextmenu", "touch", "scroll", "key",
+        "arm", "console", "upload", "navigate", "highlight",
     ])
     parser.add_argument("--reuse-tab", required=True, help="targetId of the open tab")
     parser.add_argument("--match", help="text of the control, as the observation labelled it")
@@ -71,7 +86,7 @@ def main(argv=None):
                         help="ms between keystrokes; a point of sale reads the rhythm")
     parser.add_argument("--events", help="comma-separated event names")
     parser.add_argument("--member", help="property or method name")
-    parser.add_argument("--mode", default="get", choices=["get", "set", "call", "html5", "pointer"])
+    parser.add_argument("--mode", default="get", choices=["get", "set", "call", "html5", "pointer", "accept", "dismiss"])
     parser.add_argument("--value", help="JSON value for component set")
     parser.add_argument("--modifiers", help="comma-separated: alt, ctrl, meta, shift")
     parser.add_argument("--press", type=float, default=0, help="ms to hold a click down")
@@ -88,6 +103,13 @@ def main(argv=None):
             return browser.listen([e.strip() for e in (args.events or "").split(",") if e.strip()])
         if args.operation == "heard":
             return browser.heard(clear=True)
+        if args.operation == "arm":
+            return browser.arm(dialogs=args.mode if args.mode in ("accept", "dismiss") else "accept",
+                               text=args.text or "")
+        if args.operation == "console":
+            return browser.console(clear=True)
+        if args.operation == "navigate":
+            return browser.navigate(args.text or "reload")
         if args.operation == "hold":
             return browser.hold([m.strip() for m in (args.modifiers or "").split(",") if m.strip()])
         if args.operation == "key":
@@ -106,8 +128,11 @@ def main(argv=None):
                 "actions": [{"id": a["id"], "kind": a["kind"], "label": a.get("label")}
                             for a in page["actions"]],
                 "blocked": page.get("blocked", []),
+                "keys": page.get("keys", []),
                 "omitted_actions": page.get("omitted_actions", 0),
             }
+        if args.operation == "keys":
+            return {"url": page["url"], "keys": page.get("keys", [])}
 
         if args.operation == "scroll":
             target = find(page, args.match, kind="scroll")
@@ -120,6 +145,10 @@ def main(argv=None):
             return browser.inspect(node)
         if args.operation == "hover":
             return browser.hover(node)
+        if args.operation == "highlight":
+            return browser.highlight(node)
+        if args.operation == "upload":
+            return browser.upload(node, [f.strip() for f in (args.text or "").split("|") if f.strip()])
         if args.operation == "contextmenu":
             return browser.context_menu(node)
         if args.operation == "component":
