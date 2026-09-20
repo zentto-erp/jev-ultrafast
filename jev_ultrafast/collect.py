@@ -91,6 +91,19 @@ def inspect_page(browser, url, settle=8.0):
     calls = (browser.network(all_calls=False) or {}).get("calls", [])
     page = browser.observe(screenshot=False)
 
+    # 🚨 De quien es el fallo decide si es un hallazgo o ruido.
+    #
+    # Medido contra un sitio real: diez llamadas caidas, y NUEVE eran
+    # rastreadores de terceros que el propio navegador bloqueo. Contando
+    # aquello, `clean` sale falso en cualquier sitio de internet y el veredicto
+    # no vale para nada — un informe que siempre dice que hay un problema es
+    # igual de inutil que uno que nunca lo dice.
+    #
+    # Se listan igual, porque una pagina que no carga su analitica puede
+    # importarle a alguien. Pero no deciden el veredicto.
+    ours = [one for one in calls if not one.get("third_party")]
+    theirs = [one for one in calls if one.get("third_party")]
+
     console = [one for one in seen.get("entries", [])
                if one.get("level") in ("error", "uncaught", "unhandled")]
     warnings = [one for one in seen.get("entries", []) if one.get("level") == "warn"]
@@ -99,7 +112,8 @@ def inspect_page(browser, url, settle=8.0):
         "title": page.get("title"),
         "errors": console[:20],
         "warnings": warnings[:10],
-        "failed_calls": calls[:20],
+        "failed_calls": ours[:20],
+        "failed_third_party": theirs[:10],
         # Un diálogo nativo que salta solo durante la carga es una pregunta que
         # nadie contestó hasta ahora; saber QUE se pregunto es un hallazgo.
         "dialogs": seen.get("dialogs", [])[:10],
@@ -111,11 +125,12 @@ def inspect_page(browser, url, settle=8.0):
         "keys": page.get("keys", []),
         "verdict": {
             "errors": len(console),
-            "failed_calls": len(calls),
+            "failed_calls": len(ours),
+            "failed_third_party": len(theirs),
             "dialogs": len(seen.get("dialogs", [])),
             # Limpio quiere decir "esta pantalla no se quejo", no "la
             # aplicacion funciona". Decir lo segundo desde aqui seria mentir.
-            "clean": not console and not calls,
+            "clean": not console and not ours,
             "means": "this is one screen reporting on itself, not a flow that was tested",
         },
     }

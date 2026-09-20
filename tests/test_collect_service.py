@@ -133,7 +133,7 @@ def test_limpio_exige_las_dos_cosas():
     import inspect as reflect
 
     from jev_ultrafast.collect import inspect_page
-    assert '"clean": not console and not calls' in reflect.getsource(inspect_page)
+    assert '"clean": not console and not ours' in reflect.getsource(inspect_page)
 
 
 def test_las_dos_puertas_van_al_mismo_navegador():
@@ -143,3 +143,27 @@ def test_las_dos_puertas_van_al_mismo_navegador():
     fuente = reflect.getsource(serve.handler_for)
     assert 'self.path not in ("/collect", "/inspect")' in fuente
     assert 'look=self.path == "/inspect"' in fuente
+
+
+def test_el_veredicto_no_lo_deciden_los_rastreadores_ajenos():
+    """Medido contra un sitio real: diez llamadas caídas y NUEVE eran
+    rastreadores de terceros que el propio navegador bloqueó. Contando
+    aquello, `clean` sale falso en cualquier sitio de internet, y un informe
+    que siempre dice que hay un problema es tan inútil como uno que nunca lo
+    dice. Se listan igual, pero aparte."""
+    import inspect as reflect
+
+    from jev_ultrafast.collect import inspect_page
+    fuente = reflect.getsource(inspect_page)
+    assert 'one.get("third_party")' in fuente
+    assert '"failed_third_party": theirs' in fuente
+    assert '"clean": not console and not ours' in fuente
+
+
+def test_el_host_se_conserva_cuando_la_llamada_es_de_otro():
+    """Recortando siempre a la ruta se pierde de quién era, y sin eso no se
+    puede separar un 500 de la aplicación de un rastreador bloqueado."""
+    from pathlib import Path
+    fuente = (Path(serve.__file__).parent / "browser.py").read_text(encoding="utf-8")
+    assert "third = u.origin !== location.origin" in fuente
+    assert "u.host + u.pathname + u.search" in fuente

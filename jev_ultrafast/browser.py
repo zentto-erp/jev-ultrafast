@@ -938,10 +938,19 @@ def browser_operation(request):
             .filter(r => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest')
             .slice(-120)
             .map(r => {
-              let where = r.name;
-              try { const u = new URL(r.name); where = u.pathname + u.search; } catch {}
+              let where = r.name, third = false;
+              try {
+                const u = new URL(r.name);
+                // 🚨 El host solo se tira si es NUESTRO. Recortando siempre a
+                // la ruta se pierde de quien era la llamada, y sin eso no se
+                // puede distinguir un 500 de la aplicacion de un rastreador
+                // que bloqueo el navegador — que es la diferencia entre un
+                // hallazgo y ruido.
+                third = u.origin !== location.origin;
+                where = third ? (u.host + u.pathname + u.search) : (u.pathname + u.search);
+              } catch {}
               const status = r.responseStatus ?? null;
-              return {url: where.slice(0, 200), status, ms: Math.round(r.duration),
+              return {url: where.slice(0, 200), status, ms: Math.round(r.duration), third_party: third,
                       // A zero or absent status is a request that never got an
                       // answer — refused, blocked by CORS, DNS gone. Those are
                       // the ones that leave the screen emptiest.
