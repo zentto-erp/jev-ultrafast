@@ -1,5 +1,18 @@
 (() => {
   if (!document.body) return null;
+  // Budgets. The defaults are the historical ones and stay put; a dense
+  // enterprise table can exhaust them long before the page is exhausted, and
+  // when that happens the run reports a screenful as if it were everything.
+  // `omitted_actions` says how many were dropped — the text simply ends, which
+  // is why raising it has to be possible without editing this file.
+  const budget=(name,fallback)=>{
+    const raw=window.__jevBudgets?.[name];
+    const value=Number(raw);
+    return Number.isFinite(value) && value>0 ? Math.floor(value) : fallback;
+  };
+  const MAX_ACTIONS=budget('actions',250);
+  const MAX_TEXT=budget('text',6000);
+  const MAX_SCROLLERS=budget('scrollers',4);
   const cache = window.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1};
   const identity = e => {
     if (!cache.ids.has(e)) cache.ids.set(e,cache.next++);
@@ -46,7 +59,7 @@
       .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
-    const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
+    const scope=closestDeep(e,'form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
     return [identity(e),role(e),name(e),e.value??null,e.checked??null,e.selectedIndex??null,
       e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
@@ -67,6 +80,43 @@
     };
     walk(document);
     return found;
+  };
+  // `closest` stops at the shadow boundary and returns null, so a control
+  // rendered inside a nested component never finds the row it belongs to. On an
+  // app built from components that is most rows, and the label falls back to
+  // the bare role — every control in the table reading the same again, which is
+  // exactly what the row labelling below exists to prevent.
+  // Walking up through `getRootNode().host` asks the question the author meant.
+  const closestDeep=(e,sel)=>{
+    let node=e;
+    while (node) {
+      const hit=node.closest?.(sel);
+      if (hit) return hit;
+      const root=node.getRootNode?.();
+      node=root instanceof ShadowRoot ? root.host : null;
+    }
+    return null;
+  };
+  // A layout that fills the viewport never scrolls the page, so the page-level
+  // scroll action below is not offered — while a grid inside it holds a hundred
+  // rows behind its own scrollbar. Every control past the fold is dropped for
+  // being off-screen, and the agent reports one screenful as if it were all
+  // there is. These are the containers that actually scroll.
+  const scrollables=()=>{
+    const found=[];
+    for (const e of crossRoots('*')) {
+      const style=getComputedStyle(e);
+      const downwards=/(auto|scroll)/.test(style.overflowY) && e.scrollHeight>e.clientHeight+2;
+      const sideways=/(auto|scroll)/.test(style.overflowX) && e.scrollWidth>e.clientWidth+2;
+      if ((!downwards && !sideways) || !visible(e)) continue;
+      const r=e.getBoundingClientRect();
+      // A container off-screen or thinner than a scrollbar cannot be aimed at.
+      if (r.width<40 || r.height<40 || r.bottom<=0 || r.top>=innerHeight) continue;
+      found.push({e,r,downwards,sideways});
+    }
+    // Innermost first: scrolling the outer shell when the grid is what holds
+    // the rows moves the wrong thing, and the agent concludes nothing happened.
+    return found.sort((a,b)=>(a.r.width*a.r.height)-(b.r.width*b.r.height)).slice(0,MAX_SCROLLERS);
   };
   const textRoots=()=>{
     const roots=[document.body], seen=new Set();
@@ -91,12 +141,12 @@
     let label=name(e)||rname;
     const generic=!name(e) || ['checkbox','radio','button','gridcell'].includes(label.toLowerCase());
     if (generic) {
-      const row=e.closest('tr,[role="row"]');
+      const row=closestDeep(e,'tr,[role="row"]');
       if (row) {
         // A control in the header row acts on EVERY row. Left looking like the
         // others, "select the first row" ticks select-all instead: observed on
         // a 122-row picker, where it selected all 122.
-        const header=!!e.closest('thead,[role="rowgroup"][class*="head" i]') ||
+        const header=!!closestDeep(e,'thead,[role="rowgroup"][class*="head" i]') ||
           !!row.querySelector('th,[role="columnheader"]');
         if (header) {
           label=label+' (todas las filas)';
@@ -130,7 +180,7 @@
   const words=[]; const range=document.createRange(); let node,length=0;
   const walkers=textRoots().map(r=>document.createTreeWalker(r,NodeFilter.SHOW_TEXT));
   const nextText=()=>{ while (walkers.length) { const n=walkers[0].nextNode(); if (n) return n; walkers.shift(); } return null; };
-  while ((node=nextText()) && length<6000) {
+  while ((node=nextText()) && length<MAX_TEXT) {
     const value=node.textContent.trim(), parent=node.parentElement;
     if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
     range.selectNodeContents(node); const r=range.getBoundingClientRect();
@@ -138,18 +188,42 @@
       words.push(value); length+=value.length;
     }
   }
-  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const text=words.join('\n').slice(0,MAX_TEXT), height=document.documentElement.scrollHeight;
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     document.title,text,semantics,page_key[6]];
-  const omitted_actions=Math.max(0,actions.length-250);
-  actions.splice(250);
+  const omitted_actions=Math.max(0,actions.length-MAX_ACTIONS);
+  actions.splice(MAX_ACTIONS);
   actions.forEach((a,i)=>a.id='e'+(i+1));
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  // One scroll action per container that actually scrolls, aimed at that
+  // container. The page-level pair above stays: on an ordinary document it is
+  // still the right move, and these only appear where there is something else
+  // to move. Each is labelled with what it holds, so "scroll the table" and
+  // "scroll the side panel" are not the same anonymous choice.
+  let scroller=0;
+  for (const {e,r,downwards,sideways} of scrollables()) {
+    const id=identity(e);
+    const what=(e.getAttribute('aria-label')||e.getAttribute('role')||e.tagName.toLowerCase())
+      .slice(0,40);
+    const at=++scroller;
+    if (downwards && e.scrollTop+e.clientHeight<e.scrollHeight-2)
+      actions.push({id:'scroll_in_'+at+'_down',kind:'scroll',node:id,
+        label:'Scroll down inside '+what,delta:Math.max(200,Math.round(r.height*0.8))});
+    if (downwards && e.scrollTop>0)
+      actions.push({id:'scroll_in_'+at+'_up',kind:'scroll',node:id,
+        label:'Scroll up inside '+what,delta:-Math.max(200,Math.round(r.height*0.8))});
+    if (sideways && e.scrollLeft+e.clientWidth<e.scrollWidth-2)
+      actions.push({id:'scroll_in_'+at+'_right',kind:'scroll',node:id,axis:'x',
+        label:'Scroll right inside '+what,delta:Math.max(200,Math.round(r.width*0.8))});
+    if (sideways && e.scrollLeft>0)
+      actions.push({id:'scroll_in_'+at+'_left',kind:'scroll',node:id,axis:'x',
+        label:'Scroll left inside '+what,delta:-Math.max(200,Math.round(r.width*0.8))});
+  }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};

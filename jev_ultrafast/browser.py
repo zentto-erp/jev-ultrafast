@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -9,8 +10,40 @@ from pathlib import Path
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
+
+def snapshot_budgets():
+    """Caps the observation applies, overridable per run.
+
+    The defaults are the historical ones. They are generous for an ordinary page
+    and tight for a dense enterprise table, where the run can hit them long
+    before the page is exhausted and report one screenful as if it were all
+    there is. A value that is not a positive number is ignored rather than
+    obeyed: a typo must not silently remove a cap.
+    """
+    names = {"actions": "JEV_MAX_ACTIONS", "text": "JEV_MAX_TEXT",
+             "scrollers": "JEV_MAX_SCROLLERS"}
+    chosen = {}
+    for key, variable in names.items():
+        raw = os.environ.get(variable)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            chosen[key] = value
+    return chosen
+
+
+def read_state_script():
+    """The observation, with this run's budgets attached."""
+    source = Path(__file__).with_name("snapshot.js").read_text()
+    return f"(() => {{ window.__jevBudgets={json.dumps(snapshot_budgets())}; return {source}; }})()"
+
+
 # Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+READ_STATE = read_state_script()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
 class StalePage(ValueError):
@@ -266,7 +299,38 @@ def browser_operation(request):
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            node = action.get("node")
+            if node is None:
+                # Page scroll. The fixed point is arbitrary but harmless: with
+                # nothing scrollable under it the wheel falls through to the
+                # document, which is what this branch means.
+                call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650,
+                     deltaX=0, deltaY=action["delta"])
+            else:
+                if type(node) is not int:
+                    raise ValueError("Invalid observed node")
+                # Aimed at the container the observation found, not at a guessed
+                # point. A wheel event at a fixed coordinate scrolls whatever
+                # happens to sit there — on a page that does not scroll, often
+                # nothing at all, and the agent reads that as "the list ends
+                # here". Setting scrollTop asks the element directly, and the
+                # return value says whether it actually moved, so a container
+                # already at its end cannot be mistaken for a working scroll.
+                moved = evaluate("""(action => {
+                  const e=window.__jevFast?.nodes.get(action.node);
+                  if (!e?.isConnected || !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))
+                    return null;
+                  const sideways=action.axis==='x';
+                  const before=sideways ? e.scrollLeft : e.scrollTop;
+                  if (sideways) e.scrollLeft=before+action.delta;
+                  else e.scrollTop=before+action.delta;
+                  const after=sideways ? e.scrollLeft : e.scrollTop;
+                  return {moved:after!==before,before,after};
+                })(%s)""" % json.dumps({k: action.get(k) for k in ("node", "delta", "axis")}))
+                if moved is None:
+                    raise StalePage("The container is gone or hidden")
+                if not moved["moved"]:
+                    raise RuntimeError("The container did not move; it is already at that end.")
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
