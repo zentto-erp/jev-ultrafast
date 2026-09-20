@@ -110,6 +110,7 @@ def main(argv=None):
         if args.operation == "console":
             return browser.console(clear=True)
         if args.operation == "navigate":
+            # `--text` carries the destination: reload, back, forward, or a URL.
             return browser.navigate(args.text or "reload")
         if args.operation == "hold":
             return browser.hold([m.strip() for m in (args.modifiers or "").split(",") if m.strip()])

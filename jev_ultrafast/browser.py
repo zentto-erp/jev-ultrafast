@@ -440,7 +440,7 @@ class Browser:
                                   "node": node, "files": files})
 
     def navigate(self, where="reload"):
-        """reload, back or forward."""
+        """reload, back, forward, or an http(s) address to open."""
         return browser_operation({"operation": "navigate", "session": self.session, "where": where})
 
     def highlight(self, node):
@@ -626,8 +626,23 @@ def browser_operation(request):
             if index < 0 or index >= len(entries):
                 raise ValueError(f"No history entry to go {where}")
             call("Page.navigateToHistoryEntry", entryId=entries[index]["id"])
+        elif where.startswith(("http://", "https://")):
+            # Going to an address is the one navigation that was missing, and
+            # its absence bites exactly where a run is most fragile: reaching
+            # the screen under test. Without it a case has to start at the home
+            # page and click its way in, so every step of that approach is
+            # another way to fail at something the case was not testing — and
+            # when a session drops mid-run there is no way back to where it was.
+            #
+            # Only http and https. A `javascript:` or `data:` address would be
+            # code execution wearing a URL, and this engine deliberately never
+            # lets a target turn into code.
+            result = call("Page.navigate", url=where)
+            if result.get("errorText"):
+                raise ValueError(f"Could not open {where}: {result['errorText']}")
         else:
-            raise ValueError("`where` must be reload, back or forward")
+            raise ValueError(
+                "`where` must be reload, back, forward, or an http(s) address")
         return {"navigated": where}
 
     if operation == "highlight":
