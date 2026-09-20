@@ -55,6 +55,44 @@ def key_spec(name):
     raise ValueError(f"Unknown key {name!r}; use escape, enter, tab, f2, up… or a single character")
 
 
+# Installed before anything is clicked, and again on every new document so a
+# navigation does not quietly disarm it. Idempotent: re-running replaces the
+# record, never wraps a wrapper.
+_ARM_SOURCE = """(() => {
+  const seen = window.__jevSeen ||= {console: [], dialogs: []};
+  if (!seen.original) {
+    seen.original = {alert: window.alert, confirm: window.confirm, prompt: window.prompt,
+                     error: console.error, warn: console.warn};
+  }
+  const accept = %s, reply = %s;
+  const note = (kind, message, extra) => {
+    seen.dialogs.push({kind, message: String(message ?? '').slice(0, 500), answered: extra});
+    if (seen.dialogs.length > 20) seen.dialogs.shift();
+  };
+  window.alert = (message) => { note('alert', message, 'ok'); };
+  window.confirm = (message) => { note('confirm', message, accept ? 'accept' : 'dismiss'); return accept; };
+  window.prompt = (message) => { note('prompt', message, accept ? reply : null); return accept ? reply : null; };
+  const record = (level) => (...args) => {
+    seen.console.push({level, text: args.map(a => {
+      try { return typeof a === 'string' ? a : JSON.stringify(a); } catch { return String(a); }
+    }).join(' ').slice(0, 600)});
+    if (seen.console.length > 40) seen.console.shift();
+    seen.original[level].apply(console, args);
+  };
+  console.error = record('error');
+  console.warn = record('warn');
+  window.addEventListener('error', (e) => {
+    seen.console.push({level: 'uncaught', text: String(e.message || e.error).slice(0, 600)});
+    if (seen.console.length > 40) seen.console.shift();
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    seen.console.push({level: 'unhandled', text: String(e.reason?.message || e.reason).slice(0, 600)});
+    if (seen.console.length > 40) seen.console.shift();
+  });
+  return true;
+})()"""
+
+
 def member_name(raw):
     """The property or method to reach on an element, checked before it travels.
 
@@ -383,6 +421,32 @@ class Browser:
         return browser_operation({"operation": "hold", "session": self.session,
                                   "modifiers": modifiers, "settle": settle})
 
+    def arm(self, dialogs="accept", text=""):
+        """Neutralise native dialogs and start recording the console.
+
+        Before the first click, not after: once a prompt is up there is no
+        round trip left in which to answer it.
+        """
+        return browser_operation({"operation": "arm", "session": self.session,
+                                  "dialogs": dialogs, "text": text})
+
+    def console(self, clear=False):
+        """What the page complained about, and what it tried to ask."""
+        return browser_operation({"operation": "console", "session": self.session, "clear": clear})
+
+    def upload(self, node, files):
+        """Hand files to a file input that is hidden behind a button."""
+        return browser_operation({"operation": "upload", "session": self.session,
+                                  "node": node, "files": files})
+
+    def navigate(self, where="reload"):
+        """reload, back or forward."""
+        return browser_operation({"operation": "navigate", "session": self.session, "where": where})
+
+    def highlight(self, node):
+        """Ring the element for a moment, for whoever is watching the window."""
+        return browser_operation({"operation": "highlight", "session": self.session, "node": node})
+
     def key(self, name, modifiers=None):
         """Press a key that is not text: Escape, Enter, F2, an arrow."""
         return browser_operation({"operation": "key", "session": self.session,
@@ -468,6 +532,126 @@ def browser_operation(request):
         if found is None:
             raise StalePage("That element is no longer in the document")
         return found
+
+    if operation == "arm":
+        # Two things that have to be in place BEFORE the click, not after.
+        #
+        # A native alert, confirm or prompt is not DOM. It blocks the page, and
+        # every later step then times out against a document that cannot
+        # answer: the run does not fail, it HANGS, and the cause is invisible
+        # because there is nothing in the tree to find. Answering it over the
+        # wire needs a round trip that no longer exists once it is up.
+        #
+        # So they are answered before they can block, by replacing the three
+        # functions and recording what was asked. That also turns an invisible
+        # wall into evidence: "the page asked to confirm X" is a finding.
+        #
+        # The console is the same idea. A run that clicked everything and saw
+        # no visible error can still have left a trail of them, and a stack
+        # trace is evidence a screenshot cannot give — but only if something
+        # was listening when it happened.
+        answer = request.get("dialogs", "accept")
+        if answer not in ("accept", "dismiss"):
+            raise ValueError("`dialogs` must be accept or dismiss")
+        reply = json.dumps(request.get("text") or "")
+        call("Page.addScriptToEvaluateOnNewDocument", source=_ARM_SOURCE % (
+            json.dumps(answer == "accept"), reply))
+        # And in the document already open, which the line above does not touch.
+        evaluate(_ARM_SOURCE % (json.dumps(answer == "accept"), reply))
+        return {"armed": True, "dialogs": answer}
+
+    if operation == "console":
+        entries = evaluate("(() => (window.__jevSeen?.console ?? []).slice(-40))()")
+        dialogs = evaluate("(() => (window.__jevSeen?.dialogs ?? []).slice(-20))()")
+        if request.get("clear"):
+            call("Runtime.evaluate", expression=
+                 "(() => { if (window.__jevSeen) { window.__jevSeen.console=[]; window.__jevSeen.dialogs=[]; } })()")
+        return {"entries": entries or [], "dialogs": dialogs or []}
+
+    if operation == "upload":
+        # A file input is deliberately hidden and opened by a button, so there
+        # is nothing to click and no dialog a driver can drive. The file has to
+        # be handed to the element itself.
+        node = request.get("node")
+        files = request.get("files") or []
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        if not files or not all(isinstance(f, str) for f in files):
+            raise ValueError("Pass `files` as a list of absolute paths")
+        missing = [f for f in files if not Path(f).is_file()]
+        if missing:
+            raise ValueError(f"No such file: {missing[0]}")
+        described = evaluate("""(node => {
+          const e=window.__jevFast?.nodes.get(node);
+          if (!e?.isConnected) return null;
+          // The button is not the input. If what was observed is a button, the
+          // input it opens is usually a hidden sibling or inside the same
+          // control — say so rather than failing on the wrong element.
+          const input = e.tagName === 'INPUT' && e.type === 'file' ? e
+            : e.querySelector('input[type=file]') ||
+              e.closest('*')?.querySelector('input[type=file]') || null;
+          if (!input) return {wrong:true};
+          return {ok:true, objectId:null};
+        })(%s)""" % json.dumps(node))
+        if described is None:
+            raise StalePage("That element is no longer in the document")
+        if described.get("wrong"):
+            raise ValueError("That element is not a file input and does not contain one")
+        remote = call("DOM.getDocument", depth=-1, pierce=True)
+        # Resolve the actual input node for DOM.setFileInputFiles.
+        target = evaluate("""(node => {
+          const e=window.__jevFast?.nodes.get(node);
+          const input = e.tagName === 'INPUT' && e.type === 'file' ? e : e.querySelector('input[type=file]');
+          if (!input) return null;
+          input.setAttribute('data-jev-upload', '1');
+          return true;
+        })(%s)""" % json.dumps(node))
+        if not target:
+            raise ValueError("Could not resolve the file input")
+        found = call("DOM.querySelector", nodeId=remote["root"]["nodeId"],
+                     selector="[data-jev-upload='1']")
+        call("DOM.setFileInputFiles", files=files, nodeId=found["nodeId"])
+        evaluate("""(() => { const e=document.querySelector('[data-jev-upload]');
+                             e?.removeAttribute('data-jev-upload'); })()""")
+        return {"uploaded": files}
+
+    if operation == "navigate":
+        where = request.get("where", "reload")
+        if where == "reload":
+            call("Page.reload")
+        elif where in ("back", "forward"):
+            history = call("Page.getNavigationHistory")
+            index = history["currentIndex"] + (1 if where == "forward" else -1)
+            entries = history["entries"]
+            if index < 0 or index >= len(entries):
+                raise ValueError(f"No history entry to go {where}")
+            call("Page.navigateToHistoryEntry", entryId=entries[index]["id"])
+        else:
+            raise ValueError("`where` must be reload, back or forward")
+        return {"navigated": where}
+
+    if operation == "highlight":
+        # For the person watching. A run driving a window in front of someone
+        # is hard to follow when nothing says where the next click landed.
+        node = request.get("node")
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        shown = evaluate("""(node => {
+          const e=window.__jevFast?.nodes.get(node);
+          if (!e?.isConnected) return null;
+          const r=e.getBoundingClientRect();
+          const ring=document.createElement('div');
+          ring.style.cssText=`position:fixed;left:${r.x-3}px;top:${r.y-3}px;
+            width:${r.width+6}px;height:${r.height+6}px;border:2px solid #FFB547;
+            border-radius:6px;pointer-events:none;z-index:2147483647;
+            box-shadow:0 0 0 9999px rgba(0,0,0,.08)`;
+          document.body.appendChild(ring);
+          setTimeout(() => ring.remove(), 900);
+          return {x:r.x, y:r.y};
+        })(%s)""" % json.dumps(node))
+        if shown is None:
+            raise StalePage("That element is no longer in the document")
+        return {"highlighted": node}
 
     if operation == "key":
         # Keys that are not text.
