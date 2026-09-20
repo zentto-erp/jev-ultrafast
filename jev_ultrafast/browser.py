@@ -93,6 +93,33 @@ _ARM_SOURCE = """(() => {
 })()"""
 
 
+def _arm_record(target):
+    """Where the arming choice for one tab is kept between steps."""
+    folder = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp") / "jev-armed"
+    # The target id comes from the caller, so it is checked rather than trusted:
+    # it names a file, and a name with a separator in it names another folder.
+    safe = "".join(c for c in str(target or "") if c.isalnum())
+    return (folder / f"{safe}.json") if safe else None
+
+
+def remember_arm(target, dialogs, text):
+    record = _arm_record(target)
+    if not record:
+        return
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"dialogs": dialogs, "text": text}), encoding="utf-8")
+
+
+def recall_arm(target):
+    record = _arm_record(target)
+    if not record or not record.exists():
+        return None
+    try:
+        return json.loads(record.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+
+
 def member_name(raw):
     """The property or method to reach on an element, checked before it travels.
 
@@ -312,7 +339,52 @@ class Browser:
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
 
+    def prearm_next_document(self):
+        """Register the arming for the document that is about to load.
+
+        `rearm_if_needed` is too late for a navigation: it runs once the page
+        is already there, so the calls made while it was loading — which is
+        most of them, and the ones that decide whether the screen has data —
+        happened before anything was listening. Measured: armed, navigated,
+        and an empty trail on a page that had just made a dozen requests.
+        """
+        wanted = recall_arm(self.target)
+        if not wanted:
+            return False
+        try:
+            self.call("Page.addScriptToEvaluateOnNewDocument",
+                      source=_ARM_SOURCE % (json.dumps(wanted.get("dialogs") != "dismiss"),
+                                            json.dumps(wanted.get("text") or "")))
+            return True
+        except Exception:
+            return False
+
+    def rearm_if_needed(self):
+        """Put the arming back if the page came up without it.
+
+        Cheap enough to do before every observation — one evaluate that
+        returns a boolean — and the alternative is a trail that silently stops
+        at the first navigation, which looks like an application that stopped
+        making requests.
+        """
+        wanted = recall_arm(self.target)
+        if not wanted:
+            return False
+        try:
+            if self.evaluate("(() => !!window.__jevSeen)()"):
+                return False
+            source = _ARM_SOURCE % (json.dumps(wanted.get("dialogs") != "dismiss"),
+                                    json.dumps(wanted.get("text") or ""))
+            self.call("Page.addScriptToEvaluateOnNewDocument", source=source)
+            self.call("Runtime.evaluate", expression=source)
+            return True
+        except Exception:
+            # Re-arming is a convenience. Failing it must never take down the
+            # step that was actually asked for.
+            return False
+
     def observe(self, screenshot=True):
+        self.rearm_if_needed()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -428,7 +500,23 @@ class Browser:
         round trip left in which to answer it.
         """
         return browser_operation({"operation": "arm", "session": self.session,
-                                  "dialogs": dialogs, "text": text})
+                                  "target": self.target, "dialogs": dialogs, "text": text})
+
+    def network(self, all_calls=False, clear=False):
+        """What the page asked the server for, and what came back.
+
+        Needs no arming: it reads the browser's own record of the page's
+        requests, which is already there before the first step runs.
+        """
+        return browser_operation({"operation": "network", "session": self.session,
+                                  "all": all_calls, "clear": clear})
+
+    def state(self, mode, where):
+        """Save or reload the session: cookies and both stores."""
+        if mode not in ("save", "load"):
+            raise ValueError("`mode` must be save or load")
+        return browser_operation({"operation": "state", "session": self.session,
+                                  "mode": mode, "where": where})
 
     def console(self, clear=False):
         """What the page complained about, and what it tried to ask."""
@@ -441,6 +529,7 @@ class Browser:
 
     def navigate(self, where="reload"):
         """reload, back, forward, or an http(s) address to open."""
+        self.prearm_next_document()
         return browser_operation({"operation": "navigate", "session": self.session, "where": where})
 
     def highlight(self, node):
@@ -558,6 +647,15 @@ def browser_operation(request):
             json.dumps(answer == "accept"), reply))
         # And in the document already open, which the line above does not touch.
         evaluate(_ARM_SOURCE % (json.dumps(answer == "accept"), reply))
+        # 🚨 That registration belongs to this CDP session, and this engine is
+        # one process per step — so it dies with the process, and the very next
+        # navigation comes up unarmed. Observed: `armed: true`, then a `goto`,
+        # then `armed: false` and an empty trail.
+        #
+        # "Armed" has to mean armed, not armed until you go somewhere. So the
+        # choice is remembered next to the tab it was made for, and re-applied
+        # whenever the page comes back without it.
+        remember_arm(request.get("target"), answer, request.get("text") or "")
         return {"armed": True, "dialogs": answer}
 
     if operation == "console":
@@ -567,6 +665,100 @@ def browser_operation(request):
             call("Runtime.evaluate", expression=
                  "(() => { if (window.__jevSeen) { window.__jevSeen.console=[]; window.__jevSeen.dialogs=[]; } })()")
         return {"entries": entries or [], "dialogs": dialogs or []}
+
+    if operation == "network":
+        # What the screen asked the server for, and what came back.
+        #
+        # A page can look perfectly right and be built on an answer that never
+        # arrived: the table renders empty because the request 500'd, the total
+        # is stale because the save was rejected. Nothing in the DOM says so, so
+        # a run reports success on a screen that is quietly wrong — and the
+        # reverse costs more, because a real defect gets blamed on the driver
+        # when there is no way to tell "the app failed" from "the click missed".
+        #
+        # Read from Resource Timing, which the browser keeps on its own.
+        #
+        # 🚨 The obvious implementation — wrapping `fetch` and `XMLHttpRequest`
+        # — was written first and thrown away, because it was measured and it
+        # did not work: on a real screen it caught 4 calls out of 38. It saw the
+        # session polling and missed every single `/v1` call the application
+        # actually depends on. A wrapper only sees what goes through the exact
+        # function it replaced, and a bundled application reaches the network
+        # through paths that never touch it.
+        #
+        # Resource Timing has none of that: it is the browser's own record, so
+        # it cannot be bypassed, it needs nothing installed before the page
+        # loads, it survives every navigation, and it does not monkey-patch the
+        # application under test — which is its own argument, since perturbing
+        # what you are measuring is how a driver invents defects.
+        #
+        # What it does not carry is the request method or the body. The method
+        # is a real loss and is not worth patching the page to recover; the
+        # body was never going to be recorded anyway, because it carries the
+        # session token and this ends up in evidence files.
+        calls = evaluate("""(() => {
+          // Default buffer is 250 entries and a long run silently outgrows it.
+          try { performance.setResourceTimingBufferSize(1000); } catch {}
+          return performance.getEntriesByType('resource')
+            .filter(r => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest')
+            .slice(-120)
+            .map(r => {
+              let where = r.name;
+              try { const u = new URL(r.name); where = u.pathname + u.search; } catch {}
+              const status = r.responseStatus ?? null;
+              return {url: where.slice(0, 200), status, ms: Math.round(r.duration),
+                      // A zero or absent status is a request that never got an
+                      // answer — refused, blocked by CORS, DNS gone. Those are
+                      // the ones that leave the screen emptiest.
+                      failed: status === null || status === 0 || status >= 400};
+            });
+        })()""") or []
+        if not request.get("all"):
+            calls = [one for one in calls if one.get("failed")]
+        if request.get("clear"):
+            call("Runtime.evaluate", expression="performance.clearResourceTimings()")
+        return {"calls": calls}
+
+    if operation == "state":
+        # What makes a session a session: the cookies and the two stores.
+        #
+        # Without this every run starts at the login page, and the only ways
+        # past it are worse than the problem — a password in a goal, or a human
+        # sitting there to type it. Saved once by hand, reloaded from then on.
+        #
+        # 🚨 The file IS the session. Whoever holds it is logged in as that
+        # user, so it belongs wherever a credential belongs and never in a
+        # repository, an evidence folder or an attachment.
+        where = request.get("where")
+        if request.get("mode") == "save":
+            cookies = call("Network.getCookies").get("cookies", [])
+            stores = evaluate("""(() => {
+              const dump = (s) => { try { return Object.entries({...s}); } catch { return []; } };
+              return {origin: location.origin,
+                      local: dump(localStorage), session: dump(sessionStorage)};
+            })()""") or {}
+            state = {"cookies": cookies, "origins": [stores]}
+            Path(where).write_text(json.dumps(state, indent=2), encoding="utf-8")
+            return {"saved": where, "cookies": len(cookies),
+                    "local": len(stores.get("local") or []),
+                    "session": len(stores.get("session") or [])}
+        state = json.loads(Path(where).read_text(encoding="utf-8"))
+        cookies = state.get("cookies") or []
+        if cookies:
+            call("Network.setCookies", cookies=cookies)
+        restored = 0
+        for origin in state.get("origins") or []:
+            # Only into the origin the entries came from: writing another
+            # site's tokens into this one is how a "restore" turns into a leak.
+            if origin.get("origin") and origin["origin"] != evaluate("location.origin"):
+                continue
+            evaluate("""((data) => {
+              for (const [k, v] of data.local || []) { try { localStorage.setItem(k, v); } catch {} }
+              for (const [k, v] of data.session || []) { try { sessionStorage.setItem(k, v); } catch {} }
+              return true;
+            })(%s)""" % json.dumps(origin))
+            restored += len(origin.get("local") or []) + len(origin.get("session") or [])
+        return {"loaded": where, "cookies": len(cookies), "entries": restored}
 
     if operation == "upload":
         # A file input is deliberately hidden and opened by a button, so there

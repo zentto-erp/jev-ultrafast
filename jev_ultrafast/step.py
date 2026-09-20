@@ -76,7 +76,7 @@ def main(argv=None):
     parser.add_argument("operation", choices=[
         "observe", "keys", "click", "dblclick", "fill", "inspect", "listen", "heard",
         "component", "hold", "hover", "drag", "contextmenu", "touch", "scroll", "key",
-        "arm", "console", "upload", "navigate", "highlight",
+        "arm", "console", "network", "state", "upload", "navigate", "highlight",
     ])
     parser.add_argument("--reuse-tab", required=True, help="targetId of the open tab")
     parser.add_argument("--match", help="text of the control, as the observation labelled it")
@@ -87,7 +87,8 @@ def main(argv=None):
     parser.add_argument("--events", help="comma-separated event names")
     parser.add_argument("--member", help="property or method name")
     parser.add_argument("--mode", default="get",
-                        choices=["get", "set", "call", "html5", "pointer", "accept", "dismiss"])
+                        choices=["get", "set", "call", "html5", "pointer", "accept", "dismiss",
+                                 "all", "save", "load"])
     parser.add_argument("--value", help="JSON value for component set")
     parser.add_argument("--modifiers", help="comma-separated: alt, ctrl, meta, shift")
     parser.add_argument("--press", type=float, default=0, help="ms to hold a click down")
@@ -109,6 +110,14 @@ def main(argv=None):
                                text=args.text or "")
         if args.operation == "console":
             return browser.console(clear=True)
+        if args.operation == "network":
+            # Only the failures by default: a screen can make forty calls in a
+            # step, and listing all of them buries the one that matters.
+            return browser.network(all_calls=args.mode == "all", clear=False)
+        if args.operation == "state":
+            if not args.text:
+                raise SystemExit("state needs --text <file>")
+            return browser.state("load" if args.mode == "load" else "save", args.text)
         if args.operation == "navigate":
             # `--text` carries the destination: reload, back, forward, or a URL.
             return browser.navigate(args.text or "reload")
