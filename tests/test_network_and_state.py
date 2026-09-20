@@ -89,3 +89,46 @@ def test_arming_is_remembered_so_a_navigation_does_not_undo_it():
     # And it has to happen BEFORE the navigation, or the calls made while the
     # page was loading — most of them — happened with nothing listening.
     assert re.search(r"def navigate.*?\n.*?self\.prearm_next_document\(\)", text, re.S)
+
+
+def snapshot_text():
+    return (BROWSER.parent / "snapshot.js").read_text(encoding="utf-8")
+
+
+def test_a_blocked_control_can_carry_its_reason():
+    """Knowing a control is disabled turns a dead end into "do something else
+    first". Knowing WHICH something else turns it into the next step."""
+    text = snapshot_text()
+    assert "const whyBlocked=" in text
+    assert "validationMessage" in text
+    assert "aria-errormessage" in text
+    assert "fieldset[disabled]" in text
+
+
+def test_the_title_is_not_a_reason():
+    """Measured on the real picker: the pagination buttons returned "Primera
+    fila" and "Bloque anterior" as their reason for being disabled. That is not
+    a reason, it is the button's name — and a confident wrong reason is worse
+    than none, because it sends the run somewhere specific that is not there."""
+    text = snapshot_text()
+    start = text.index("const whyBlocked=")
+    body = text[start:text.index("for (const e of crossRoots(selector))", start)]
+    assert "getAttribute('title')" not in body
+
+
+def test_no_reason_is_reported_when_the_page_gives_none():
+    """Saying nothing is the honest answer, and it is also the signal that the
+    application should publish one."""
+    text = snapshot_text()
+    assert "return null;\n  };" in text[text.index("const whyBlocked="):]
+    assert "blocked.push(why ? {role:role(e),label:label.slice(0,80),why}" in text
+
+
+def test_each_refusal_to_act_says_which_refusal_it_is():
+    """They all used to come back as one null, and one null became "Target
+    changed or is covered" — a sentence that names two very different
+    situations and is wrong about at least one of them every time."""
+    text = source()
+    for reason in ("gone from the document", "disabled now", "no longer visible",
+                   "read-only now", "scrolled out of the viewport", "covered by"):
+        assert reason in text, reason

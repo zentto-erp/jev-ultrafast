@@ -1208,13 +1208,31 @@ def browser_operation(request):
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
+            # Every refusal below says WHICH refusal it is.
+            #
+            # They all used to come back as one null, and one null became
+            # "Target changed or is covered" — a sentence that names two very
+            # different situations and is wrong about at least one of them
+            # every time. The run then reports a stale page when what actually
+            # happened was a cookie banner on top of the button, or a field
+            # that went read-only, or a control that scrolled out of view.
+            #
+            # Each of those has a different next step, and telling them apart
+            # is most of the difference between "the application failed" and
+            # "the driver failed".
             target = evaluate("""(action => {
               const e=window.__jevFast?.nodes.get(action.node);
-              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
-                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
+              if (!e?.isConnected) return {no:'gone from the document'};
+              if (e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]'))
+                return {no:'disabled now — something earlier in the form turned it off'};
+              if (!e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))
+                return {no:'no longer visible'};
+              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true'))
+                return {no:'read-only now'};
               const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
+              if (!r.width || !r.height) return {no:'has no size on screen'};
+              if (x<0 || y<0 || x>=innerWidth || y>=innerHeight)
+                return {no:'scrolled out of the viewport — scroll to it first'};
               // elementFromPoint stops at the shadow boundary and returns the
               // component HOST, so `e.contains(hit)` is false for anything
               // inside it and the action is discarded as unreachable. The agent
@@ -1231,20 +1249,35 @@ def browser_operation(request):
                 return node;
               };
               const hit=deepHit(x,y);
-              if (!(hit===e || e.contains(hit) || hit?.contains(e))) return null;
+              if (!(hit===e || e.contains(hit) || hit?.contains(e))) {
+                // Name what is on top. "Covered" sends a run looking for a
+                // problem in the control; "covered by the cookie banner"
+                // sends it to close the banner, which is the actual step.
+                const who=hit ? (hit.getAttribute?.('aria-label') || hit.id ||
+                                 (hit.innerText||'').trim().split('
+')[0] ||
+                                 hit.className || hit.tagName || '').toString().slice(0,60) : '';
+                return {no: who ? `covered by "${who}"` : 'covered by something else'};
+              }
               if (action.kind==='select') {
-                if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
-                    !o.disabled && !o.closest('optgroup[disabled]'))) return null;
+                if (e.tagName!=='SELECT') return {no:'is not a dropdown'};
+                if (![...e.options].some(o=>o.value===action.value &&
+                    !o.disabled && !o.closest('optgroup[disabled]')))
+                  return {no:'has no such option available'};
                 e.value=action.value;
                 e.dispatchEvent(new Event('input',{bubbles:true}));
                 e.dispatchEvent(new Event('change',{bubbles:true}));
               }
               return {x,y};
             })(""" + json.dumps(action) + ")")
-            if target is None:
+            refused = (target or {}).get("no") if isinstance(target, dict) else None
+            if target is None or refused:
+                because = refused or "changed while it was being resolved"
                 if kind == "select":
-                    raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
-                raise StalePage("Target changed or is covered. Observe again.")
+                    raise RuntimeError(
+                        f"Dropdown execution was not confirmed: it {because}. "
+                        "Inspect before retrying.")
+                raise StalePage(f"Cannot act: the target {because}. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
                 # Holding a modifier is a gesture, not decoration. Applications
