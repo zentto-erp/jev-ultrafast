@@ -167,3 +167,49 @@ def test_el_host_se_conserva_cuando_la_llamada_es_de_otro():
     fuente = (Path(serve.__file__).parent / "browser.py").read_text(encoding="utf-8")
     assert "third = u.origin !== location.origin" in fuente
     assert "u.host + u.pathname + u.search" in fuente
+
+
+def test_un_reinicio_de_chrome_no_se_convierte_en_un_502(monkeypatch):
+    """Chrome se reinicia —se cae, lo reinicia systemd, se actualiza— y la
+    conexión muere con él. Al que llama eso le llegaba como un 502, que le dice
+    que su petición estaba mal cuando lo único que pasó es que el navegador se
+    estaba levantando."""
+    intentos = {"abiertos": 0}
+
+    class Caido:
+        def __init__(self, falla):
+            self.falla = falla
+
+        def close(self):
+            pass
+
+    def abrir(endpoint):
+        intentos["abiertos"] += 1
+        return Caido(falla=intentos["abiertos"] == 1)
+
+    def recoger(browser, url, match, settle):
+        if browser.falla:
+            raise RuntimeError("WebSocket connection closed")
+        return {"url": url, "groups": []}
+
+    monkeypatch.setattr(serve, "open_browser", abrir)
+    monkeypatch.setattr(serve, "collect", recoger)
+    salida = serve.Collector("http://x").gather(["https://ejemplo.com"], None, 0)
+    assert salida == [{"url": "https://ejemplo.com", "groups": []}]
+    assert intentos["abiertos"] == 2, "no abrió un navegador nuevo para el segundo intento"
+
+
+def test_el_segundo_fallo_si_se_reporta(monkeypatch):
+    """Reintentar para siempre esconderia un navegador que no arranca."""
+    monkeypatch.setattr(serve, "open_browser", lambda endpoint: type("X", (), {"close": lambda s: None})())
+    monkeypatch.setattr(serve, "collect", lambda *a: (_ for _ in ()).throw(RuntimeError("muerto")))
+    with pytest.raises(RuntimeError, match="muerto"):
+        serve.Collector("http://x").gather(["https://ejemplo.com"], None, 0)
+
+
+def test_reintentar_solo_vale_porque_esto_solo_lee():
+    """Una accion que cambia algo no se reintenta nunca: no hay forma de saber
+    si el primer intento llego, y repetirlo duplicaria lo que hizo."""
+    import inspect
+
+    assert "SOLO LEE" in inspect.getsource(serve.Collector.gather)
