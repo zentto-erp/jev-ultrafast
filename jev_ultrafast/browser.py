@@ -19,6 +19,42 @@ _MODIFIER_BITS = {name.lower(): bit for name, _code, bit in MODIFIERS}
 _MODIFIER_BITS.update({"ctrl": 2, "cmd": 4, "command": 4, "option": 1, "opt": 1})
 
 
+# Keys that mean something on their own. CDP wants the virtual key code as well
+# as the name: without it Chrome delivers an event the page does not recognise,
+# which is why "press Escape" appeared not to work rather than to fail.
+NAMED_KEYS = {
+    "escape": ("Escape", "Escape", 27), "esc": ("Escape", "Escape", 27),
+    "enter": ("Enter", "Enter", 13), "return": ("Enter", "Enter", 13),
+    "tab": ("Tab", "Tab", 9),
+    "space": (" ", "Space", 32),
+    "backspace": ("Backspace", "Backspace", 8),
+    "delete": ("Delete", "Delete", 46), "del": ("Delete", "Delete", 46),
+    "home": ("Home", "Home", 36), "end": ("End", "End", 35),
+    "pageup": ("PageUp", "PageUp", 33), "pagedown": ("PageDown", "PageDown", 34),
+    "up": ("ArrowUp", "ArrowUp", 38), "down": ("ArrowDown", "ArrowDown", 40),
+    "left": ("ArrowLeft", "ArrowLeft", 37), "right": ("ArrowRight", "ArrowRight", 39),
+    "arrowup": ("ArrowUp", "ArrowUp", 38), "arrowdown": ("ArrowDown", "ArrowDown", 40),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37), "arrowright": ("ArrowRight", "ArrowRight", 39),
+}
+NAMED_KEYS.update({f"f{n}": (f"F{n}", f"F{n}", 111 + n) for n in range(1, 13)})
+
+
+def key_spec(name):
+    """Resolve a key name, or refuse it.
+
+    An unknown name must not be sent as a one-character key: pressing the letter
+    "e" when the case asked for "escape" closes nothing, changes nothing, and
+    reads as the key not working.
+    """
+    resolved = NAMED_KEYS.get(str(name).strip().lower())
+    if resolved:
+        return resolved
+    text = str(name)
+    if len(text) == 1:
+        return (text, None, ord(text.upper()))
+    raise ValueError(f"Unknown key {name!r}; use escape, enter, tab, f2, up… or a single character")
+
+
 def member_name(raw):
     """The property or method to reach on an element, checked before it travels.
 
@@ -312,6 +348,66 @@ class Browser:
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
+    # ─── Directed operations ──────────────────────────────────────────────
+    #
+    # `act` exists for the loop where the model picks the next move. These are
+    # for the caller that already knows what it wants: a test case naming the
+    # row to drag, the value to read, the key to hold.
+    #
+    # They were written and left unreachable — implemented in
+    # `browser_operation` with nothing exposing them, so a run could not use
+    # one even knowing it was there. A capability nobody can call is the same
+    # as a capability that does not exist, and an agent reported exactly that:
+    # "the engine has no inspect mode". It had one. It had no door.
+
+    def inspect(self, node):
+        """What an element holds, without touching it."""
+        return browser_operation({"operation": "inspect", "session": self.session, "node": node})
+
+    def listen(self, events):
+        """Start recording the component's own events."""
+        return browser_operation({"operation": "listen", "session": self.session, "events": events})
+
+    def heard(self, clear=False):
+        """What arrived since `listen`. Empty is an answer."""
+        return browser_operation({"operation": "heard", "session": self.session, "clear": clear})
+
+    def component(self, node, member, mode="get", value=None, args=None):
+        """Read, set or call a named member of a custom element."""
+        return browser_operation({"operation": "component", "session": self.session,
+                                  "node": node, "member": member, "mode": mode,
+                                  "value": value, "args": args or []})
+
+    def hold(self, modifiers, settle=0.8):
+        """Hold a modifier and observe while it is down."""
+        return browser_operation({"operation": "hold", "session": self.session,
+                                  "modifiers": modifiers, "settle": settle})
+
+    def key(self, name, modifiers=None):
+        """Press a key that is not text: Escape, Enter, F2, an arrow."""
+        return browser_operation({"operation": "key", "session": self.session,
+                                  "key": name, "modifiers": modifiers or []})
+
+    def hover(self, node, settle=0.25):
+        """Move the pointer there for real, so `mousemove` listeners fire."""
+        return browser_operation({"operation": "hover", "session": self.session,
+                                  "node": node, "settle": settle})
+
+    def drag(self, node, to=None, dx=0, dy=0, mode=None, steps=8, at_top=False):
+        """Drag by pointer, or `mode="html5"` for elements with `draggable`."""
+        return browser_operation({"operation": "drag", "session": self.session,
+                                  "node": node, "to": to, "dx": dx, "dy": dy,
+                                  "mode": mode, "steps": steps, "atTop": at_top})
+
+    def context_menu(self, node):
+        """Right click."""
+        return browser_operation({"operation": "contextmenu", "session": self.session, "node": node})
+
+    def touch(self, enabled=True, points=1):
+        """Switch touch emulation mid-run; the tree changes with it."""
+        return browser_operation({"operation": "touch", "session": self.session,
+                                  "enabled": enabled, "points": points})
+
     def close(self):
         # A borrowed tab is not ours to close: the caller is reusing it across
         # runs, and closing it would defeat the reason for lending it.
@@ -372,6 +468,45 @@ def browser_operation(request):
         if found is None:
             raise StalePage("That element is no longer in the document")
         return found
+
+    if operation == "key":
+        # Keys that are not text.
+        #
+        # Escape closes a dialog, Enter commits a cell, F2 opens the editor, the
+        # arrows move the active cell. None of them can be typed: `insertText`
+        # inserts characters, and a grid waiting for F2 receives nothing.
+        #
+        # This is also why "press Escape" looked unreliable rather than absent —
+        # there was no way to send one, so whatever was tried was something
+        # else, and the page ignored it exactly as it should.
+        name, code, virtual = key_spec(request.get("key"))
+        held = modifier_mask(request.get("modifiers"))
+        pressed = []
+        try:
+            for mod_name, mod_code, bit in MODIFIERS:
+                if held & bit:
+                    call("Input.dispatchKeyEvent", type="rawKeyDown", key=mod_name,
+                         code=mod_code, modifiers=held)
+                    pressed.append((mod_name, mod_code))
+            down = {"type": "rawKeyDown" if code else "keyDown", "key": name,
+                    "windowsVirtualKeyCode": virtual, "nativeVirtualKeyCode": virtual,
+                    "modifiers": held}
+            if code:
+                down["code"] = code
+            else:
+                # A printable key carries its text, or nothing is inserted.
+                down["text"] = name
+                down["unmodifiedText"] = name
+            call("Input.dispatchKeyEvent", **down)
+            up = {"type": "keyUp", "key": name, "windowsVirtualKeyCode": virtual,
+                  "nativeVirtualKeyCode": virtual, "modifiers": held}
+            if code:
+                up["code"] = code
+            call("Input.dispatchKeyEvent", **up)
+        finally:
+            for mod_name, mod_code in reversed(pressed):
+                call("Input.dispatchKeyEvent", type="keyUp", key=mod_name, code=mod_code)
+        return {"pressed": name}
 
     if operation == "component":
         # Some state has no attribute and no control.
