@@ -181,6 +181,48 @@
   // worse. Dropped from `actions` because it cannot be pressed, reported in
   // `blocked` because knowing it exists is what makes the next step obvious.
   const blocked=[];
+  // And WHY, which is the part nobody reports.
+  //
+  // Knowing a control is disabled turns a dead end into "do something else
+  // first". Knowing WHICH something else turns it into the next step. Without
+  // it the agent still has to guess, and on a form with eight fields it will
+  // guess wrong most of the time — or worse, decide the screen is broken.
+  //
+  // Nothing here is invented: every answer comes from something the page
+  // already told the browser, and the same things a screen reader would say.
+  // When none of them speaks, this says nothing rather than making something
+  // up — a confident wrong reason is worse than no reason, because it sends
+  // the run somewhere specific.
+  const textOf=(ids)=>String(ids||'').split(/\s+/).filter(Boolean)
+    .map(id=>{ const n=document.getElementById(id); return n && visible(n) ? n.innerText.trim() : ''; })
+    .filter(Boolean).join(' ').slice(0,120);
+  const whyBlocked=(e)=>{
+    // The browser's own explanation, which is also the one the user sees.
+    try { if (e.willValidate && !e.validity?.valid && e.validationMessage)
+      return e.validationMessage.slice(0,120); } catch {}
+    const described=textOf(e.getAttribute('aria-errormessage')) ||
+                    textOf(e.getAttribute('aria-describedby'));
+    if (described) return described;
+    // A whole section switched off explains every control inside it, and is
+    // the difference between "fill this in" and "this step is not yours yet".
+    const fieldset=closestDeep(e,'fieldset[disabled],[aria-disabled="true"]');
+    if (fieldset && fieldset!==e) {
+      const legend=fieldset.querySelector('legend')?.innerText?.trim() || name(fieldset);
+      return legend ? `inside "${legend.slice(0,60)}", which is disabled` : 'inside a disabled section';
+    }
+    // El `title` NO sirve aqui, y medirlo lo demostro: en el selector real
+    // los botones de paginacion devolvieron "Primera fila" y "Bloque
+    // anterior" como razon de estar deshabilitados. Eso no es una razon, es
+    // el nombre del boton — y un motivo con aplomo y equivocado es peor que
+    // ninguno, porque manda la corrida a un sitio concreto que no existe.
+    // The distinction CDP already makes and no client passes on: a control
+    // marked aria-disabled is disabled by the APPLICATION, not by the form.
+    // That is a rule somewhere, not a missing field, and it is usually a
+    // permission or a state the document is in.
+    if (e.getAttribute('aria-disabled')==='true' && !e.matches(':disabled'))
+      return 'the application disabled it, not the form';
+    return null;
+  };
   for (const e of crossRoots(selector)) {
     if (!safe(e) || !visible(e)) continue;
     if (e.matches(':disabled') || e.closest('[aria-disabled="true"]') ||
@@ -188,7 +230,11 @@
       const r=e.getBoundingClientRect();
       if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight) {
         const label=name(e)||role(e);
-        if (label && blocked.length<MAX_BLOCKED) blocked.push({role:role(e),label:label.slice(0,80)});
+        if (label && blocked.length<MAX_BLOCKED) {
+          const why=whyBlocked(e);
+          blocked.push(why ? {role:role(e),label:label.slice(0,80),why}
+                           : {role:role(e),label:label.slice(0,80)});
+        }
       }
       continue;
     }

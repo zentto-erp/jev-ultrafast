@@ -93,6 +93,113 @@ _ARM_SOURCE = """(() => {
 })()"""
 
 
+_INTERACTIVE_NODES = {"BUTTON", "A", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"}
+
+
+def _attributes(node):
+    """CDP hands attributes back as a flat [name, value, name, value…] list."""
+    flat = node.get("attributes") or []
+    return dict(zip(flat[0::2], flat[1::2]))
+
+
+def _node_text(node, budget=60):
+    """Whatever this node reads as, for naming it."""
+    if node.get("nodeType") == 3:
+        return (node.get("nodeValue") or "").strip()
+    parts = []
+    for child in node.get("children") or []:
+        parts.append(_node_text(child, budget))
+        if sum(len(p) for p in parts) > budget:
+            break
+    return " ".join(p for p in parts if p).strip()
+
+
+def _name_of(node):
+    attrs = _attributes(node)
+    return (attrs.get("aria-label") or _node_text(node) or attrs.get("title")
+            or attrs.get("placeholder") or attrs.get("name") or attrs.get("id") or "")
+
+
+def closed_roots(document_root):
+    """Every closed shadow root, and the controls sealed inside it.
+
+    A closed root is private to script by design: `element.shadowRoot` is null,
+    so the observation — which runs as script in the page — cannot see in, and
+    the content is not merely unreachable but *unreported*. That is the worst
+    shape a blind spot can take: the run answers confidently about a screen
+    whose other half it never knew was there.
+
+    CDP is not script and is not bound by that rule: `DOM.getDocument` with
+    `pierce` returns closed roots like any other. Measured against a
+    deliberately closed root: script said there was no shadow root at all, CDP
+    returned it with the button inside.
+
+    Nothing is opened and nothing is patched. The page behaves exactly as its
+    author intended; this only refuses to pretend the content is not there.
+    """
+    found = []
+
+    def collect(node, into):
+        attrs = _attributes(node)
+        if node.get("nodeName") in _INTERACTIVE_NODES or attrs.get("role") or attrs.get("onclick"):
+            label = _name_of(node)
+            if label or node.get("nodeName") in _INTERACTIVE_NODES:
+                into.append({
+                    "kind": (attrs.get("role") or node.get("nodeName", "")).lower(),
+                    "label": label[:60],
+                    # The handle CDP itself uses. Geometry and clicks resolve
+                    # from it, so nothing here is a selector and nothing is a
+                    # guess about the page's structure.
+                    "backend": node.get("backendNodeId"),
+                })
+        for child in node.get("children") or []:
+            collect(child, into)
+        for root in node.get("shadowRoots") or []:
+            collect(root, into)
+
+    def walk(node, host=""):
+        mine = _name_of(node) or host
+        for root in node.get("shadowRoots") or []:
+            if root.get("shadowRootType") == "closed":
+                inside = []
+                collect(root, inside)
+                found.append({"host": (mine or node.get("nodeName", "")).strip()[:60],
+                              "inside": inside})
+            walk(root, mine)
+        for child in node.get("children") or []:
+            walk(child, mine)
+
+    walk(document_root)
+    return found
+
+
+def _arm_record(target):
+    """Where the arming choice for one tab is kept between steps."""
+    folder = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp") / "jev-armed"
+    # The target id comes from the caller, so it is checked rather than trusted:
+    # it names a file, and a name with a separator in it names another folder.
+    safe = "".join(c for c in str(target or "") if c.isalnum())
+    return (folder / f"{safe}.json") if safe else None
+
+
+def remember_arm(target, dialogs, text):
+    record = _arm_record(target)
+    if not record:
+        return
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"dialogs": dialogs, "text": text}), encoding="utf-8")
+
+
+def recall_arm(target):
+    record = _arm_record(target)
+    if not record or not record.exists():
+        return None
+    try:
+        return json.loads(record.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+
+
 def member_name(raw):
     """The property or method to reach on an element, checked before it travels.
 
@@ -312,7 +419,52 @@ class Browser:
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
 
+    def prearm_next_document(self):
+        """Register the arming for the document that is about to load.
+
+        `rearm_if_needed` is too late for a navigation: it runs once the page
+        is already there, so the calls made while it was loading — which is
+        most of them, and the ones that decide whether the screen has data —
+        happened before anything was listening. Measured: armed, navigated,
+        and an empty trail on a page that had just made a dozen requests.
+        """
+        wanted = recall_arm(self.target)
+        if not wanted:
+            return False
+        try:
+            self.call("Page.addScriptToEvaluateOnNewDocument",
+                      source=_ARM_SOURCE % (json.dumps(wanted.get("dialogs") != "dismiss"),
+                                            json.dumps(wanted.get("text") or "")))
+            return True
+        except Exception:
+            return False
+
+    def rearm_if_needed(self):
+        """Put the arming back if the page came up without it.
+
+        Cheap enough to do before every observation — one evaluate that
+        returns a boolean — and the alternative is a trail that silently stops
+        at the first navigation, which looks like an application that stopped
+        making requests.
+        """
+        wanted = recall_arm(self.target)
+        if not wanted:
+            return False
+        try:
+            if self.evaluate("(() => !!window.__jevSeen)()"):
+                return False
+            source = _ARM_SOURCE % (json.dumps(wanted.get("dialogs") != "dismiss"),
+                                    json.dumps(wanted.get("text") or ""))
+            self.call("Page.addScriptToEvaluateOnNewDocument", source=source)
+            self.call("Runtime.evaluate", expression=source)
+            return True
+        except Exception:
+            # Re-arming is a convenience. Failing it must never take down the
+            # step that was actually asked for.
+            return False
+
     def observe(self, screenshot=True):
+        self.rearm_if_needed()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -428,7 +580,23 @@ class Browser:
         round trip left in which to answer it.
         """
         return browser_operation({"operation": "arm", "session": self.session,
-                                  "dialogs": dialogs, "text": text})
+                                  "target": self.target, "dialogs": dialogs, "text": text})
+
+    def network(self, all_calls=False, clear=False):
+        """What the page asked the server for, and what came back.
+
+        Needs no arming: it reads the browser's own record of the page's
+        requests, which is already there before the first step runs.
+        """
+        return browser_operation({"operation": "network", "session": self.session,
+                                  "all": all_calls, "clear": clear})
+
+    def state(self, mode, where):
+        """Save or reload the session: cookies and both stores."""
+        if mode not in ("save", "load"):
+            raise ValueError("`mode` must be save or load")
+        return browser_operation({"operation": "state", "session": self.session,
+                                  "mode": mode, "where": where})
 
     def console(self, clear=False):
         """What the page complained about, and what it tried to ask."""
@@ -440,8 +608,49 @@ class Browser:
                                   "node": node, "files": files})
 
     def navigate(self, where="reload"):
-        """reload, back or forward."""
+        """reload, back, forward, or an http(s) address to open."""
+        self.prearm_next_document()
         return browser_operation({"operation": "navigate", "session": self.session, "where": where})
+
+    def sealed(self, match=None):
+        """What is inside the closed components, and press one of them.
+
+        Without `match` it lists them. With it, the first control whose label
+        matches is clicked where it actually is on screen.
+
+        The click goes through `DOM.getBoxModel`, which is CDP asking the
+        renderer for the real rectangle — not a guess, and not a coordinate a
+        model produced. A control with no box is off-screen or not rendered,
+        and that is said rather than clicked at 0,0.
+        """
+        document = self.call("DOM.getDocument", depth=-1, pierce=True)
+        roots = closed_roots(document["root"])
+        if not match:
+            return {"closed_roots": roots,
+                    "note": "script cannot see into these; CDP can. Press one with --match."}
+        wanted = match.strip().lower()
+        for root in roots:
+            for one in root["inside"]:
+                if wanted in (one.get("label") or "").lower():
+                    try:
+                        box = self.call("DOM.getBoxModel", backendNodeId=one["backend"])["model"]
+                    except Exception:
+                        raise StalePage(
+                            f"{one['label']!r} is inside a closed component and has no box "
+                            "on screen — it is not rendered, or it is scrolled away.")
+                    quad = box["content"]
+                    x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+                    y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+                    for event in ("mousePressed", "mouseReleased"):
+                        self.call("Input.dispatchMouseEvent", type=event, x=x, y=y,
+                                  button="left", clickCount=1)
+                    self.wait_until_settled()
+                    return {"pressed": one["label"], "inside": root["host"], "at": [x, y]}
+        raise SystemExit(json.dumps({
+            "error": "not_found",
+            "looked_for": match,
+            "available": [one.get("label") for root in roots for one in root["inside"]][:40],
+        }))
 
     def highlight(self, node):
         """Ring the element for a moment, for whoever is watching the window."""
@@ -558,6 +767,15 @@ def browser_operation(request):
             json.dumps(answer == "accept"), reply))
         # And in the document already open, which the line above does not touch.
         evaluate(_ARM_SOURCE % (json.dumps(answer == "accept"), reply))
+        # 🚨 That registration belongs to this CDP session, and this engine is
+        # one process per step — so it dies with the process, and the very next
+        # navigation comes up unarmed. Observed: `armed: true`, then a `goto`,
+        # then `armed: false` and an empty trail.
+        #
+        # "Armed" has to mean armed, not armed until you go somewhere. So the
+        # choice is remembered next to the tab it was made for, and re-applied
+        # whenever the page comes back without it.
+        remember_arm(request.get("target"), answer, request.get("text") or "")
         return {"armed": True, "dialogs": answer}
 
     if operation == "console":
@@ -567,6 +785,100 @@ def browser_operation(request):
             call("Runtime.evaluate", expression=
                  "(() => { if (window.__jevSeen) { window.__jevSeen.console=[]; window.__jevSeen.dialogs=[]; } })()")
         return {"entries": entries or [], "dialogs": dialogs or []}
+
+    if operation == "network":
+        # What the screen asked the server for, and what came back.
+        #
+        # A page can look perfectly right and be built on an answer that never
+        # arrived: the table renders empty because the request 500'd, the total
+        # is stale because the save was rejected. Nothing in the DOM says so, so
+        # a run reports success on a screen that is quietly wrong — and the
+        # reverse costs more, because a real defect gets blamed on the driver
+        # when there is no way to tell "the app failed" from "the click missed".
+        #
+        # Read from Resource Timing, which the browser keeps on its own.
+        #
+        # 🚨 The obvious implementation — wrapping `fetch` and `XMLHttpRequest`
+        # — was written first and thrown away, because it was measured and it
+        # did not work: on a real screen it caught 4 calls out of 38. It saw the
+        # session polling and missed every single `/v1` call the application
+        # actually depends on. A wrapper only sees what goes through the exact
+        # function it replaced, and a bundled application reaches the network
+        # through paths that never touch it.
+        #
+        # Resource Timing has none of that: it is the browser's own record, so
+        # it cannot be bypassed, it needs nothing installed before the page
+        # loads, it survives every navigation, and it does not monkey-patch the
+        # application under test — which is its own argument, since perturbing
+        # what you are measuring is how a driver invents defects.
+        #
+        # What it does not carry is the request method or the body. The method
+        # is a real loss and is not worth patching the page to recover; the
+        # body was never going to be recorded anyway, because it carries the
+        # session token and this ends up in evidence files.
+        calls = evaluate("""(() => {
+          // Default buffer is 250 entries and a long run silently outgrows it.
+          try { performance.setResourceTimingBufferSize(1000); } catch {}
+          return performance.getEntriesByType('resource')
+            .filter(r => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest')
+            .slice(-120)
+            .map(r => {
+              let where = r.name;
+              try { const u = new URL(r.name); where = u.pathname + u.search; } catch {}
+              const status = r.responseStatus ?? null;
+              return {url: where.slice(0, 200), status, ms: Math.round(r.duration),
+                      // A zero or absent status is a request that never got an
+                      // answer — refused, blocked by CORS, DNS gone. Those are
+                      // the ones that leave the screen emptiest.
+                      failed: status === null || status === 0 || status >= 400};
+            });
+        })()""") or []
+        if not request.get("all"):
+            calls = [one for one in calls if one.get("failed")]
+        if request.get("clear"):
+            call("Runtime.evaluate", expression="performance.clearResourceTimings()")
+        return {"calls": calls}
+
+    if operation == "state":
+        # What makes a session a session: the cookies and the two stores.
+        #
+        # Without this every run starts at the login page, and the only ways
+        # past it are worse than the problem — a password in a goal, or a human
+        # sitting there to type it. Saved once by hand, reloaded from then on.
+        #
+        # 🚨 The file IS the session. Whoever holds it is logged in as that
+        # user, so it belongs wherever a credential belongs and never in a
+        # repository, an evidence folder or an attachment.
+        where = request.get("where")
+        if request.get("mode") == "save":
+            cookies = call("Network.getCookies").get("cookies", [])
+            stores = evaluate("""(() => {
+              const dump = (s) => { try { return Object.entries({...s}); } catch { return []; } };
+              return {origin: location.origin,
+                      local: dump(localStorage), session: dump(sessionStorage)};
+            })()""") or {}
+            state = {"cookies": cookies, "origins": [stores]}
+            Path(where).write_text(json.dumps(state, indent=2), encoding="utf-8")
+            return {"saved": where, "cookies": len(cookies),
+                    "local": len(stores.get("local") or []),
+                    "session": len(stores.get("session") or [])}
+        state = json.loads(Path(where).read_text(encoding="utf-8"))
+        cookies = state.get("cookies") or []
+        if cookies:
+            call("Network.setCookies", cookies=cookies)
+        restored = 0
+        for origin in state.get("origins") or []:
+            # Only into the origin the entries came from: writing another
+            # site's tokens into this one is how a "restore" turns into a leak.
+            if origin.get("origin") and origin["origin"] != evaluate("location.origin"):
+                continue
+            evaluate("""((data) => {
+              for (const [k, v] of data.local || []) { try { localStorage.setItem(k, v); } catch {} }
+              for (const [k, v] of data.session || []) { try { sessionStorage.setItem(k, v); } catch {} }
+              return true;
+            })(%s)""" % json.dumps(origin))
+            restored += len(origin.get("local") or []) + len(origin.get("session") or [])
+        return {"loaded": where, "cookies": len(cookies), "entries": restored}
 
     if operation == "upload":
         # A file input is deliberately hidden and opened by a button, so there
@@ -626,8 +938,23 @@ def browser_operation(request):
             if index < 0 or index >= len(entries):
                 raise ValueError(f"No history entry to go {where}")
             call("Page.navigateToHistoryEntry", entryId=entries[index]["id"])
+        elif where.startswith(("http://", "https://")):
+            # Going to an address is the one navigation that was missing, and
+            # its absence bites exactly where a run is most fragile: reaching
+            # the screen under test. Without it a case has to start at the home
+            # page and click its way in, so every step of that approach is
+            # another way to fail at something the case was not testing — and
+            # when a session drops mid-run there is no way back to where it was.
+            #
+            # Only http and https. A `javascript:` or `data:` address would be
+            # code execution wearing a URL, and this engine deliberately never
+            # lets a target turn into code.
+            result = call("Page.navigate", url=where)
+            if result.get("errorText"):
+                raise ValueError(f"Could not open {where}: {result['errorText']}")
         else:
-            raise ValueError("`where` must be reload, back or forward")
+            raise ValueError(
+                "`where` must be reload, back, forward, or an http(s) address")
         return {"navigated": where}
 
     if operation == "highlight":
@@ -1001,13 +1328,31 @@ def browser_operation(request):
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
+            # Every refusal below says WHICH refusal it is.
+            #
+            # They all used to come back as one null, and one null became
+            # "Target changed or is covered" — a sentence that names two very
+            # different situations and is wrong about at least one of them
+            # every time. The run then reports a stale page when what actually
+            # happened was a cookie banner on top of the button, or a field
+            # that went read-only, or a control that scrolled out of view.
+            #
+            # Each of those has a different next step, and telling them apart
+            # is most of the difference between "the application failed" and
+            # "the driver failed".
             target = evaluate("""(action => {
               const e=window.__jevFast?.nodes.get(action.node);
-              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
-                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
+              if (!e?.isConnected) return {no:'gone from the document'};
+              if (e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]'))
+                return {no:'disabled now — something earlier in the form turned it off'};
+              if (!e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))
+                return {no:'no longer visible'};
+              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true'))
+                return {no:'read-only now'};
               const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
+              if (!r.width || !r.height) return {no:'has no size on screen'};
+              if (x<0 || y<0 || x>=innerWidth || y>=innerHeight)
+                return {no:'scrolled out of the viewport — scroll to it first'};
               // elementFromPoint stops at the shadow boundary and returns the
               // component HOST, so `e.contains(hit)` is false for anything
               // inside it and the action is discarded as unreachable. The agent
@@ -1024,20 +1369,35 @@ def browser_operation(request):
                 return node;
               };
               const hit=deepHit(x,y);
-              if (!(hit===e || e.contains(hit) || hit?.contains(e))) return null;
+              if (!(hit===e || e.contains(hit) || hit?.contains(e))) {
+                // Name what is on top. "Covered" sends a run looking for a
+                // problem in the control; "covered by the cookie banner"
+                // sends it to close the banner, which is the actual step.
+                const who=hit ? (hit.getAttribute?.('aria-label') || hit.id ||
+                                 (hit.innerText||'').trim().split('
+')[0] ||
+                                 hit.className || hit.tagName || '').toString().slice(0,60) : '';
+                return {no: who ? `covered by "${who}"` : 'covered by something else'};
+              }
               if (action.kind==='select') {
-                if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
-                    !o.disabled && !o.closest('optgroup[disabled]'))) return null;
+                if (e.tagName!=='SELECT') return {no:'is not a dropdown'};
+                if (![...e.options].some(o=>o.value===action.value &&
+                    !o.disabled && !o.closest('optgroup[disabled]')))
+                  return {no:'has no such option available'};
                 e.value=action.value;
                 e.dispatchEvent(new Event('input',{bubbles:true}));
                 e.dispatchEvent(new Event('change',{bubbles:true}));
               }
               return {x,y};
             })(""" + json.dumps(action) + ")")
-            if target is None:
+            refused = (target or {}).get("no") if isinstance(target, dict) else None
+            if target is None or refused:
+                because = refused or "changed while it was being resolved"
                 if kind == "select":
-                    raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
-                raise StalePage("Target changed or is covered. Observe again.")
+                    raise RuntimeError(
+                        f"Dropdown execution was not confirmed: it {because}. "
+                        "Inspect before retrying.")
+                raise StalePage(f"Cannot act: the target {because}. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
                 # Holding a modifier is a gesture, not decoration. Applications

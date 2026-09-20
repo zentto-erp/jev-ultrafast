@@ -71,3 +71,39 @@ def test_the_shipped_regex_accepts_function_keys_and_rejects_prose():
     assert {"F2", "F9", "F12", "Esc", "Escape", "Enter", "f4"} <= accepted
     # F13 and F0 do not exist on a keyboard; a combination is not a bare key.
     assert accepted.isdisjoint({"Ctrl", "K", "Guardar", "", "F13", "F0", "Shift+F2"})
+
+
+def browser_source():
+    return (Path(__file__).resolve().parents[1] / "jev_ultrafast" / "browser.py").read_text(encoding="utf-8")
+
+
+def navigate_branch():
+    """The navigate handler as shipped, from its `if` to the next one."""
+    source = browser_source()
+    start = source.index('if operation == "navigate":')
+    return source[start:source.index('if operation == "highlight":', start)]
+
+
+def test_an_address_is_a_destination_like_any_other():
+    """Reaching the screen under test was the one navigation missing: a case had
+    to start at the home page and click its way in, so every step of that
+    approach was another way to fail at something it was not testing."""
+    branch = navigate_branch()
+    assert 'call("Page.navigate", url=where)' in branch
+
+
+def test_only_http_and_https_are_accepted():
+    """A javascript: or data: address is code execution wearing a URL, and this
+    engine never lets a target turn into code."""
+    branch = navigate_branch()
+    assert 'where.startswith(("http://", "https://"))' in branch
+    # The rejection has to be the fallback, so an unknown scheme cannot slip
+    # past by simply not matching any branch.
+    assert "must be reload, back, forward, or an http(s) address" in branch
+
+
+def test_a_refused_navigation_is_raised_not_swallowed():
+    """Chrome reports a blocked or unreachable address in the result, not as an
+    error. Returning success there would report a run against a page that never
+    loaded — the failure mode this whole engine exists to avoid."""
+    assert 'result.get("errorText")' in navigate_branch()
