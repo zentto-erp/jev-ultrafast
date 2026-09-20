@@ -87,22 +87,36 @@ class Collector:
 
     def gather(self, urls, match, settle, look=False):
         with self.lock:
-            if self.browser is None:
-                self.browser = open_browser(self.endpoint)
-            try:
-                if look:
-                    return [inspect_page(self.browser, url, settle) for url in urls]
-                return [collect(self.browser, url, match, settle) for url in urls]
-            except Exception:
-                # Un navegador que se cayó deja a este objeto sirviendo errores
-                # para siempre. Se suelta para que la siguiente petición lo
-                # levante otra vez en vez de heredar el cadáver.
+            # Dos intentos, y el segundo con un navegador nuevo.
+            #
+            # Chrome se reinicia —se cae, lo reinicia systemd, se actualiza— y
+            # la conexión que teníamos muere con él. Al que llama eso le
+            # llegaba como un 502, que le dice que su petición estaba mal
+            # cuando lo único que pasó es que el navegador se estaba
+            # levantando. Medido: un reinicio de Chrome y la siguiente
+            # petición fallaba, la de después iba bien.
+            #
+            # 🚨 Reintentar aquí es seguro porque esto SOLO LEE. Una acción que
+            # cambia algo no se reintenta nunca: no hay forma de saber si el
+            # primer intento llegó, y repetirlo duplicaría lo que hizo.
+            for last in (False, True):
+                if self.browser is None:
+                    self.browser = open_browser(self.endpoint)
                 try:
-                    self.browser.close()
+                    if look:
+                        return [inspect_page(self.browser, url, settle) for url in urls]
+                    return [collect(self.browser, url, match, settle) for url in urls]
                 except Exception:
-                    pass
-                self.browser = None
-                raise
+                    # Un navegador caído deja a este objeto sirviendo errores
+                    # para siempre. Se suelta para que el siguiente intento lo
+                    # levante otra vez en vez de heredar el cadáver.
+                    try:
+                        self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = None
+                    if last:
+                        raise
 
 
 def handler_for(collector, token):
