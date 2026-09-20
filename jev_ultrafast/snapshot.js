@@ -14,6 +14,7 @@
   const MAX_TEXT=budget('text',6000);
   const MAX_SCROLLERS=budget('scrollers',4);
   const MAX_BLOCKED=budget('blocked',12);
+  const MAX_KEYS=budget('keys',16);
   const cache = window.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1};
   const identity = e => {
     if (!cache.ids.has(e)) cache.ids.set(e,cache.next++);
@@ -296,6 +297,48 @@
     }
   }
   const text=words.join('\n').slice(0,MAX_TEXT), height=document.documentElement.scrollHeight;
+  // Keyboard shortcuts the screen actually offers, read off the screen itself.
+  //
+  // A key is the cheapest way to drive an application: nothing to find, nothing
+  // to hit-test, no dependence on how the button is laid out at this width. But
+  // WHICH keys exist is a property of the screen, not of the app — a listing has
+  // no Save — and a hardcoded table in a prompt goes stale the day one moves.
+  //
+  // So they are discovered, not assumed. A well-built app writes the key on the
+  // control (in a `kbd` chip, or in the title so the tooltip carries it), for
+  // the same reason it matters here: a shortcut nobody can see is a shortcut
+  // nobody uses. That convention is the source — if the key is not written
+  // anywhere, it was not offered to the user either, and an agent leaning on it
+  // would be relying on something no human could have discovered.
+  //
+  // Reported with the enabled state, because a key wired to a disabled control
+  // is inert: pressing it is not a failure of the app, and a run that treats
+  // silence as a bug reports its own mistake.
+  const keys=[], keyseen=new Set();
+  const KEY=/^(F(?:[1-9]|1[0-2])|Esc|Escape|Supr|Del|Delete|Ins|Insert|Intro|Enter|Tab)$/i;
+  const addKey=(raw,host)=>{
+    const key=String(raw||'').trim();
+    if (!KEY.test(key) || keys.length>=MAX_KEYS) return;
+    const control=host&&closestDeep(host,'button,[role="button"],a[href],[role="menuitem"],[title]')||host;
+    if (!control || !visible(control)) return;
+    // The label is the control minus the key chip itself, so it reads "Guardar"
+    // and not "Guardar F2" — the key is already the other half of the pair.
+    const label=(name(control)||control.innerText||'').replace(new RegExp('\\(?\\b'+key+'\\b\\)?','ig'),'')
+      .replace(/\s+/g,' ').trim().slice(0,60);
+    const id=key.toUpperCase()+'|'+label.toLowerCase();
+    if (!label || keyseen.has(id)) return;
+    keyseen.add(id);
+    const off=control.matches(':disabled')||control.getAttribute('aria-disabled')==='true'||
+      !!control.closest('[aria-disabled="true"]');
+    keys.push(off?{key,label,disabled:true}:{key,label});
+  };
+  for (const e of crossRoots('kbd')) addKey(e.textContent,e);
+  for (const e of crossRoots('[title],[aria-keyshortcuts]')) {
+    const shortcut=e.getAttribute('aria-keyshortcuts');
+    if (shortcut) { addKey(shortcut,e); continue; }
+    const m=/\(([^()]{1,10})\)\s*$/.exec(e.getAttribute('title')||'');
+    if (m) addKey(m[1],e);
+  }
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
@@ -333,5 +376,5 @@
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,blocked,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,blocked,keys,marker,page_key,guards,omitted_actions};
 })()

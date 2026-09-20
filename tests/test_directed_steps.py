@@ -116,3 +116,35 @@ def test_a_missing_control_lists_what_was_there():
         step().find(page, "Confirmar")
     assert "not_found" in str(stop.value.code)
     assert "Cancelar" in str(stop.value.code)
+
+
+def test_an_unreachable_control_offers_its_key():
+    """A button scrolled out of the viewport is not a missing button.
+
+    It has no rectangle to click, so it never reaches `actions` — but the key
+    bound to it needs no rectangle at all. Reporting "not found" there would end
+    a run over something that was one keystroke away.
+    """
+    page = {"actions": [{"id": "e1", "kind": "click", "label": "Cancelar", "node": 1}],
+            "blocked": [], "keys": [{"key": "F2", "label": "Guardar"}]}
+    with pytest.raises(SystemExit) as stop:
+        step().find(page, "Guardar")
+    assert "not_clickable" in str(stop.value.code)
+    assert "F2" in str(stop.value.code)
+
+
+def test_a_key_on_a_disabled_control_is_not_offered():
+    """An inert key is worse than no key: it invites a press that does nothing,
+    and the run then reports the application as broken."""
+    page = {"actions": [], "blocked": [], "keys": [{"key": "F2", "label": "Guardar", "disabled": True}]}
+    with pytest.raises(SystemExit) as stop:
+        step().find(page, "Guardar")
+    assert "not_found" in str(stop.value.code)
+
+
+def test_keys_is_a_real_operation():
+    """Listed in the parser, or the agent is told about a door that is not there."""
+    import inspect
+    source = inspect.getsource(step().main)
+    assert '"observe", "keys",' in source
+    assert 'args.operation == "keys"' in source

@@ -149,7 +149,49 @@ The rest of the pattern:
 
 ---
 
-## 7. Verify by asking, not by having clicked
+## 7. Prefer a key to a click
+
+A button has to be found. It can be off-screen, inside a shadow root, renamed,
+re-laid-out at a narrower width, or disabled until something else happens. Every
+one of those is a way for a run to fail at a step that has nothing to do with
+what it was testing.
+
+A key has none of those problems. It does not move, it does not need a
+rectangle, and it does not care how the button is labelled this month.
+
+So when a screen offers keys, use them. An application built for people who
+capture documents all day usually does — it is the convention in business
+software, and the same shortcut that makes an operator fast makes a run short
+and stable. The mapping in this ERP:
+
+| Key | Action |
+|---|---|
+| F2 | Save |
+| F3 | Focus the search box |
+| F4 | Open the picker for the main entity — supplier, customer, vehicle |
+| F6 | Open the article picker / add a line |
+| F8 | New document |
+| F9 | Recalculate |
+| Esc | Back / cancel |
+
+Three things worth knowing before leaning on them:
+
+- **The screen decides which ones exist.** A listing has no Save. Ask the
+  observation, or read the button: the key is written on it, and on its
+  `title`.
+- **They do not fire while the focus is in a field**, or inside a component that
+  handles its own keyboard — a grid keeps its own F2 for editing a cell. Click
+  somewhere neutral first, or drive the grid on its own terms.
+- **F1, F5, F11 and F12 belong to the browser.** Nothing sensible binds them, so
+  do not expect them to do anything in the page.
+
+Keys do not replace clicking: a row still has to be clicked, and a checkbox
+ticked. They replace *hunting for the button afterwards*, which is where runs
+actually break.
+
+---
+
+## 8. Verify by asking, not by having clicked
 
 The observation is capped and summarised on purpose; otherwise every step would
 carry the whole page. The value a check depends on may simply not be in it.
@@ -165,7 +207,7 @@ observation, after the page settles.
 
 ---
 
-## 8. Changing module can be a full page load
+## 9. Changing module can be a full page load
 
 An application assembled from micro-frontends is not one SPA. Each module is a
 separate build with its own base path, and moving between them is
@@ -186,7 +228,7 @@ tenant, or a language change that reloads.
 
 ---
 
-## 9. Settling
+## 10. Settling
 
 `readyState === "complete"` arrives **before** the render with data. Observing
 there reads the shell: measured at 924 ms on a screen whose table was already
@@ -196,7 +238,7 @@ Wait for the DOM to stop changing, not for the document to finish loading.
 
 ---
 
-## 10. Budgets are policy
+## 11. Budgets are policy
 
 250 actions and 6000 characters of text are generous for a page and tight for a
 dense table. When they run out, the run reports one screenful as if it were
