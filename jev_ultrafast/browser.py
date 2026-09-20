@@ -1455,8 +1455,7 @@ def browser_operation(request):
                 // problem in the control; "covered by the cookie banner"
                 // sends it to close the banner, which is the actual step.
                 const who=hit ? (hit.getAttribute?.('aria-label') || hit.id ||
-                                 (hit.innerText||'').trim().split('
-')[0] ||
+                                 (hit.innerText||'').trim().split(String.fromCharCode(10))[0] ||
                                  hit.className || hit.tagName || '').toString().slice(0,60) : '';
                 return {no: who ? `covered by "${who}"` : 'covered by something else'};
               }

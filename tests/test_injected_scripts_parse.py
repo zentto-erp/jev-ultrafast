@@ -95,3 +95,40 @@ def test_the_expression_declared_actually_builds_parses(tmp_path):
     assert enviado.get("js"), "declared() ya no pasa por _await — revisa este test"
     result = parses(enviado["js"], tmp_path, "declared.js")
     assert result.returncode == 0, result.stderr
+
+
+def every_injected_literal():
+    """Cada cadena triple que browser.py manda a la pagina como JS.
+
+    No solo las que tienen nombre. La tercera vez que un escape de Python se
+    coló en un literal de JS fue dentro del bloque que resuelve el objetivo de
+    cada accion — que no era `_ARM_SOURCE` ni `snapshot.js`, asi que los dos
+    tests anteriores daban verde mientras TODOS los clicks fallaban.
+    """
+    source = (ROOT / "browser.py").read_text(encoding="utf-8")
+    for match in re.finditer(r'(?:evaluate|expression=)\("""(.*?)"""', source, re.S):
+        body = match.group(1)
+        if "=>" not in body and "(" not in body:
+            continue
+        # Los huecos que Python rellena en tiempo de ejecucion: el `%s` de las
+        # plantillas y el argumento que se concatena tras la cadena.
+        filled = body.replace("%s", "({})")
+        if filled.rstrip().endswith("("):
+            filled = filled.rstrip() + "{})"
+        yield match.start(), filled
+
+
+def test_every_javascript_literal_sent_to_the_page_parses(tmp_path):
+    """Un error de sintaxis aqui no falla con ruido: el script entero se
+    descarta antes de correr una linea, asi que la operacion simplemente no
+    hace nada y el informe culpa a la pagina.
+
+    Medido: un `split` con un salto de linea escapado dejo `act` roto, y con el
+    TODOS los clicks del motor, mientras los 258 tests seguian en verde.
+    """
+    checked = 0
+    for at, body in every_injected_literal():
+        result = parses(body, tmp_path, f"literal{at}.js")
+        assert result.returncode == 0, f"el literal en el offset {at} no parsea:\n{result.stderr}"
+        checked += 1
+    assert checked >= 3, f"solo se comprobaron {checked} literales — la extraccion se quedo corta"
