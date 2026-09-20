@@ -13,6 +13,7 @@
   const MAX_ACTIONS=budget('actions',250);
   const MAX_TEXT=budget('text',6000);
   const MAX_SCROLLERS=budget('scrollers',4);
+  const MAX_BLOCKED=budget('blocked',12);
   const cache = window.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1};
   const identity = e => {
     if (!cache.ids.has(e)) cache.ids.set(e,cache.next++);
@@ -172,8 +173,24 @@
     return roots;
   };
   const actions=[];
+  // A control that is visible but disabled is not a dead end: it is the page
+  // saying "do something else first". The confirm button of a picker dialog is
+  // disabled until a row is ticked, so an agent that cannot see it concludes
+  // there is no way to confirm — and takes Cancel, or Create new, which is
+  // worse. Dropped from `actions` because it cannot be pressed, reported in
+  // `blocked` because knowing it exists is what makes the next step obvious.
+  const blocked=[];
   for (const e of crossRoots(selector)) {
-    if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
+    if (!safe(e) || !visible(e)) continue;
+    if (e.matches(':disabled') || e.closest('[aria-disabled="true"]') ||
+        e.getAttribute('aria-disabled')==='true') {
+      const r=e.getBoundingClientRect();
+      if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight) {
+        const label=name(e)||role(e);
+        if (label && blocked.length<MAX_BLOCKED) blocked.push({role:role(e),label:label.slice(0,80)});
+      }
+      continue;
+    }
     const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
     if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
@@ -239,6 +256,34 @@
       label:own.slice(0,80),kind:'click',value:'',
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}});
   }
+  // Third pass: cells that open an editor on DOUBLE click.
+  //
+  // A grid whose cells edit in place is invisible to a single click, so the
+  // whole capture flow of a document — the lines of an invoice, the quantities,
+  // the prices — cannot be driven at all. The cell is not an input until the
+  // second click creates one, so nothing in the first two passes matches it.
+  //
+  // A double click costs nothing where it does nothing, so the cell is offered
+  // wherever one could plausibly open something: a real gridcell, or a cell
+  // that says it is editable.
+  for (const e of crossRoots('td,th,[role="gridcell"],[role="columnheader"],[class*="editable" i]')) {
+    const r=e.getBoundingClientRect();
+    if (r.width<16 || r.height<16) continue;
+    const x=r.x+r.width/2, y=r.y+r.height/2;
+    if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+    if (!visible(e)) continue;
+    // A cell whose content is already a control is driven through that control.
+    if (e.querySelector(selector)) continue;
+    const own=(e.innerText||'').replace(/\s+/g,' ').trim();
+    if (!own) continue;
+    // Name it by its row, the same way the controls above are: a hundred cells
+    // called "12,00" are a hundred indistinguishable targets.
+    const row=closestDeep(e,'tr,[role="row"]');
+    const context=row ? (row.innerText||'').replace(/\s+/g,' ').trim().slice(0,60) : '';
+    actions.push({node:identity(e),role:'cell',kind:'dblclick',value:own.slice(0,120),
+      label:'Edit cell '+own.slice(0,40)+(context ? ' — '+context : ''),
+      rect:{x:r.x,y:r.y,w:r.width,h:r.height}});
+  }
   const words=[]; const range=document.createRange(); let node,length=0;
   const walkers=textRoots().map(r=>document.createTreeWalker(r,NodeFilter.SHOW_TEXT));
   const nextText=()=>{ while (walkers.length) { const n=walkers[0].nextNode(); if (n) return n; walkers.shift(); } return null; };
@@ -288,5 +333,5 @@
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,blocked,marker,page_key,guards,omitted_actions};
 })()

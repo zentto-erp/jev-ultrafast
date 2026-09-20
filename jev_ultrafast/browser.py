@@ -11,6 +11,34 @@ from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
 
+# CDP modifier bits: Alt 1, Ctrl 2, Meta 4, Shift 8.
+MODIFIERS = (("Alt", "AltLeft", 1), ("Control", "ControlLeft", 2),
+             ("Meta", "MetaLeft", 4), ("Shift", "ShiftLeft", 8))
+_MODIFIER_BITS = {name.lower(): bit for name, _code, bit in MODIFIERS}
+# What people call them. `cmd` and `option` are the Mac names for the same keys.
+_MODIFIER_BITS.update({"ctrl": 2, "cmd": 4, "command": 4, "option": 1, "opt": 1})
+
+
+def modifier_mask(names):
+    """Turn ["ctrl", "alt"] into the bitmask CDP expects.
+
+    Unknown names are refused rather than ignored: a run that asks for
+    `ctrl+shift` and silently gets a plain click reports a pass for a gesture
+    that never happened, which is worse than failing.
+    """
+    if not names:
+        return 0
+    if isinstance(names, str):
+        names = [names]
+    mask = 0
+    for name in names:
+        bit = _MODIFIER_BITS.get(str(name).strip().lower())
+        if bit is None:
+            raise ValueError(f"Unknown modifier {name!r}; use alt, ctrl, meta or shift")
+        mask |= bit
+    return mask
+
+
 def snapshot_budgets():
     """Caps the observation applies, overridable per run.
 
@@ -328,6 +356,37 @@ def browser_operation(request):
             raise StalePage("That element is no longer in the document")
         return found
 
+    if operation == "hold":
+        # Some behaviour exists only while a key is DOWN: Alt revealing the code
+        # under a name, Ctrl showing the shortcuts of the screen. A press and a
+        # release with nothing in between observes the page as it was, so the
+        # feature reads as absent and the run reports a failure that is its own.
+        #
+        # Press, observe, release — one operation. Splitting it into two calls
+        # would leave the key held between them, and any later step would run
+        # inside a modifier nobody remembers pressing.
+        held = modifier_mask(request.get("modifiers"))
+        if not held:
+            raise ValueError("Nothing to hold; pass modifiers such as ['alt']")
+        pressed = []
+        try:
+            for name, code, bit in MODIFIERS:
+                if held & bit:
+                    call("Input.dispatchKeyEvent", type="rawKeyDown", key=name,
+                         code=code, modifiers=held)
+                    pressed.append((name, code))
+            # Some of these appear after a deliberate delay — the shortcut hint
+            # waits 450 ms so it does not flash on every copy-paste. Observing
+            # immediately would miss exactly what we came to see.
+            time.sleep(float(request.get("settle", 0.8)))
+            seen = evaluate(READ_STATE)
+        finally:
+            for name, code in reversed(pressed):
+                call("Input.dispatchKeyEvent", type="keyUp", key=name, code=code)
+        if seen is None:
+            raise StalePage("The document changed while the key was held")
+        return seen
+
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
@@ -407,8 +466,42 @@ def browser_operation(request):
                 raise StalePage("Target changed or is covered. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
-                for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+                # Holding a modifier is a gesture, not decoration. Applications
+                # hang real behaviour on it: Alt to reveal the code under a
+                # name, Ctrl to show the shortcuts of the screen, Shift to
+                # extend a selection, Ctrl-click to open in a new tab. Without
+                # this the agent cannot reach any of it — and cannot verify a
+                # feature whose whole point is the key being down.
+                #
+                # The modifier is pressed, the click happens inside it, and it
+                # is released in a `finally`: leaving Ctrl stuck down poisons
+                # every later step of the run, and that failure looks like the
+                # page misbehaving rather than the driver.
+                held = modifier_mask(action.get("modifiers"))
+                pressed = []
+                try:
+                    for name, code, bit in MODIFIERS:
+                        if held & bit:
+                            call("Input.dispatchKeyEvent", type="rawKeyDown", key=name,
+                                 code=code, modifiers=held)
+                            pressed.append((name, code))
+                    # A grid that edits in place opens its editor on the SECOND
+                    # click. Sending one leaves the cell exactly as it was, so
+                    # the whole capture flow of a document is undrivable.
+                    # Chrome wants the full sequence with a rising count, not a
+                    # single event with clickCount 2.
+                    if kind == "dblclick":
+                        for count in (1, 2):
+                            for event in ("mousePressed", "mouseReleased"):
+                                call("Input.dispatchMouseEvent", type=event, x=x, y=y,
+                                     button="left", clickCount=count, modifiers=held)
+                    else:
+                        for event in ("mousePressed", "mouseReleased"):
+                            call("Input.dispatchMouseEvent", type=event, x=x, y=y,
+                                 button="left", clickCount=1, modifiers=held)
+                finally:
+                    for name, code in reversed(pressed):
+                        call("Input.dispatchKeyEvent", type="keyUp", key=name, code=code)
                 if kind == "fill":
                     call(
                         "Input.dispatchKeyEvent",
