@@ -77,9 +77,45 @@
       for (const e of root.querySelectorAll(selector)) found.push(e);
       // Only open roots are reachable; a closed one is deliberately private.
       for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot);
+      // A same-origin iframe is a document too, and its contents are as real as
+      // anything else on the page — report viewers and print previews live
+      // there. Cross-origin frames throw on access by design; that is a wall,
+      // not a bug, so it is stepped over quietly.
+      for (const f of root.querySelectorAll('iframe,frame')) {
+        let inner=null;
+        try { inner=f.contentDocument; } catch { inner=null; }
+        if (inner) walk(inner);
+      }
     };
     walk(document);
     return found;
+  };
+  // Half of an application is not built from buttons. A card, a row, a tile or
+  // a chip is a div with a click handler: no role, no tabindex, nothing the
+  // standard selector matches — so it does not exist for the agent, which then
+  // reports that the list cannot be opened. Measured on a data grid whose
+  // mobile view is cards: every card a plain div, none of them reachable.
+  //
+  // Listeners cannot be read from script, so the honest proxy is the one the
+  // author already gave the user: `cursor: pointer` means "this reacts". It is
+  // also what accessibility tooling uses.
+  const looksClickable=e=>{
+    if (e.matches(selector)) return false;          // already offered
+    if (e.closest('label')) return false;           // the control it labels is offered
+    const style=getComputedStyle(e);
+    const pointer=style.cursor==='pointer';
+    const declared=e.hasAttribute('onclick') || e.hasAttribute('tabindex') ||
+      ['row','listitem','treeitem','article'].includes(e.getAttribute('role'));
+    if (!pointer && !declared) return false;
+    // A parent painted with `pointer` makes every child look clickable. Offer
+    // the OUTERMOST element of such a group: clicking a card is the intent,
+    // clicking the text inside it is the same click reported four times.
+    const parent=e.parentElement;
+    if (parent && getComputedStyle(parent).cursor==='pointer' && !parent.matches(selector)) return false;
+    // A container holding its own controls is scaffolding, not a target — the
+    // controls inside are already offered and are the real intent.
+    if (e.querySelector(selector)) return false;
+    return true;
   };
   // `closest` stops at the shadow boundary and returns null, so a control
   // rendered inside a nested component never finds the row it belongs to. On an
@@ -124,6 +160,13 @@
       if (!root || seen.has(root)) return;
       seen.add(root);
       for (const e of root.querySelectorAll('*')) if (e.shadowRoot) { roots.push(e.shadowRoot); walk(e.shadowRoot); }
+      // Text inside a same-origin frame is page text; a report preview that
+      // renders there would otherwise read as a blank screen.
+      for (const f of root.querySelectorAll('iframe,frame')) {
+        let inner=null;
+        try { inner=f.contentDocument; } catch { inner=null; }
+        if (inner?.body) { roots.push(inner.body); walk(inner); }
+      }
     };
     walk(document);
     return roots;
@@ -176,6 +219,25 @@
       actions.push({...base,kind:editable?'fill':'click',value});
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
+  }
+  // Second pass: everything that behaves like a control without being one.
+  // Geometry is checked BEFORE the computed style, which is the expensive call:
+  // on a large application this walks thousands of nodes, and most are rejected
+  // by a rectangle that costs nothing.
+  for (const e of crossRoots('*')) {
+    const r=e.getBoundingClientRect();
+    if (r.width<16 || r.height<16) continue;
+    const x=r.x+r.width/2, y=r.y+r.height/2;
+    if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+    if (!visible(e) || !looksClickable(e)) continue;
+    const own=(e.innerText||e.getAttribute('aria-label')||e.getAttribute('title')||'')
+      .replace(/\s+/g,' ').trim();
+    // Without text there is nothing to tell it apart from its neighbours, and
+    // an unnameable target is one the model cannot choose on purpose.
+    if (!own) continue;
+    actions.push({node:identity(e),role:e.getAttribute('role')||'clickable',
+      label:own.slice(0,80),kind:'click',value:'',
+      rect:{x:r.x,y:r.y,w:r.width,h:r.height}});
   }
   const words=[]; const range=document.createRange(); let node,length=0;
   const walkers=textRoots().map(r=>document.createTreeWalker(r,NodeFilter.SHOW_TEXT));

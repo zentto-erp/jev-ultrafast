@@ -295,6 +295,39 @@ def browser_operation(request):
             raise StalePage("Document changed during evaluation")
         return result.get("result", {}).get("value")
 
+    if operation == "inspect":
+        # Asking instead of acting. The observation is capped and summarised —
+        # by design, or every step would carry the whole page — so the value a
+        # check depends on may simply not be in it. Without a way to ask, a run
+        # can only report that it clicked Save, never that the record exists.
+        #
+        # Read-only: it resolves a node the observation already found and
+        # returns what it holds. It cannot navigate, type or click, so it can be
+        # used freely to verify without changing what is being verified.
+        node = request.get("node")
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        found = evaluate("""(node => {
+          const e=window.__jevFast?.nodes.get(node);
+          if (!e?.isConnected) return null;
+          const r=e.getBoundingClientRect();
+          const attrs={};
+          for (const a of e.attributes||[]) attrs[a.name]=a.value.slice(0,200);
+          return {
+            tag:e.tagName.toLowerCase(),
+            text:(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,4000),
+            value:'value' in e ? String(e.value) : null,
+            checked:e.checked??null,
+            disabled:e.matches(':disabled'),
+            visible:e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}),
+            rect:{x:r.x,y:r.y,w:r.width,h:r.height},
+            attributes:attrs,
+          };
+        })(%s)""" % json.dumps(node))
+        if found is None:
+            raise StalePage("That element is no longer in the document")
+        return found
+
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
