@@ -103,3 +103,43 @@ def test_el_log_por_defecto_esta_apagado():
     petición."""
     import inspect
     assert "def log_message" in inspect.getsource(serve.handler_for)
+
+
+def test_inspeccionar_arma_antes_de_navegar():
+    """Después es tarde: los errores de consola y los diálogos de la carga
+    —que son la mayoría— ya habrían ocurrido sin nadie escuchando."""
+    import inspect as reflect
+
+    from jev_ultrafast.collect import inspect_page
+    fuente = reflect.getsource(inspect_page)
+    assert fuente.index("browser.arm()") < fuente.index("browser.navigate(")
+
+
+def test_el_veredicto_no_dice_que_la_aplicacion_funcione():
+    """Esto mira UNA pantalla. Decir desde aquí que un flujo va bien sería
+    exactamente el fallo que este motor existe para no cometer."""
+    import inspect as reflect
+
+    from jev_ultrafast.collect import inspect_page
+    fuente = reflect.getsource(inspect_page)
+    assert "not a flow that was tested" in fuente
+    for prohibido in ('"pass"', "'PASS'", '"ok": True'):
+        assert prohibido not in fuente
+
+
+def test_limpio_exige_las_dos_cosas():
+    """Una pantalla sin errores de consola pero con un 500 detrás no está
+    limpia: se ve bien y está montada sobre una respuesta que no llegó."""
+    import inspect as reflect
+
+    from jev_ultrafast.collect import inspect_page
+    assert '"clean": not console and not calls' in reflect.getsource(inspect_page)
+
+
+def test_las_dos_puertas_van_al_mismo_navegador():
+    """Separarlas evita que una corrida que solo quería datos cargue con un
+    informe de errores, y al revés."""
+    import inspect as reflect
+    fuente = reflect.getsource(serve.handler_for)
+    assert 'self.path not in ("/collect", "/inspect")' in fuente
+    assert 'look=self.path == "/inspect"' in fuente
