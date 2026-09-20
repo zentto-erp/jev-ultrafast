@@ -946,7 +946,18 @@ def browser_operation(request):
                 // puede distinguir un 500 de la aplicacion de un rastreador
                 // que bloqueo el navegador — que es la diferencia entre un
                 // hallazgo y ruido.
-                third = u.origin !== location.origin;
+                // Comparar el ORIGEN entero deja fuera la propia API cuando
+                // vive en un subdominio, que es lo normal: api.sitio.com
+                // frente a app.sitio.com. Y justo esas son las llamadas cuyo
+                // 500 hay que ver — clasificarlas como ajenas las saca del
+                // veredicto y el informe dice que todo va bien.
+                //
+                // Se comparan las dos ultimas etiquetas del host. Es una
+                // aproximacion: para un dominio con sufijo compuesto -.co.uk-
+                // agrupa de mas, y eso es preferible a lo de antes, que
+                // descartaba la API de todo el mundo.
+                const raiz = (h) => h.split('.').slice(-2).join('.');
+                third = raiz(u.hostname) !== raiz(location.hostname);
                 where = third ? (u.host + u.pathname + u.search) : (u.pathname + u.search);
               } catch {}
               const status = r.responseStatus ?? null;

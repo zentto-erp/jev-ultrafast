@@ -165,7 +165,7 @@ def test_el_host_se_conserva_cuando_la_llamada_es_de_otro():
     puede separar un 500 de la aplicación de un rastreador bloqueado."""
     from pathlib import Path
     fuente = (Path(serve.__file__).parent / "browser.py").read_text(encoding="utf-8")
-    assert "third = u.origin !== location.origin" in fuente
+    assert "raiz(u.hostname) !== raiz(location.hostname)" in fuente
     assert "u.host + u.pathname + u.search" in fuente
 
 
@@ -213,3 +213,14 @@ def test_reintentar_solo_vale_porque_esto_solo_lee():
     import inspect
 
     assert "SOLO LEE" in inspect.getsource(serve.Collector.gather)
+
+
+def test_la_api_en_un_subdominio_sigue_siendo_nuestra():
+    """api.sitio.com frente a app.sitio.com es lo normal —Zentto hace
+    exactamente eso— y comparar el origen entero saca del veredicto justo las
+    llamadas cuyo 500 hay que ver. Medido: el 401 de gamma-api.polymarket.com
+    salia clasificado como de un tercero."""
+    from pathlib import Path
+    fuente = (Path(serve.__file__).parent / "browser.py").read_text(encoding="utf-8")
+    assert "const raiz = (h) => h.split('.').slice(-2).join('.')" in fuente
+    assert "u.origin !== location.origin" not in fuente
