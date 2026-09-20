@@ -12,6 +12,7 @@ error anywhere. The parse check would have caught it in a second.
 Offline: node only, no browser and no network.
 """
 
+import importlib
 import re
 import shutil
 import subprocess
@@ -58,3 +59,39 @@ def test_the_armed_script_declares_each_name_once(tmp_path):
     result = parses(broken, tmp_path, "broken.js")
     assert result.returncode != 0
     assert "already been declared" in result.stderr
+
+
+def test_the_expression_declared_actually_builds_parses(tmp_path):
+    """El JS que vive dentro de un metodo se inyecta igual y se rompe igual.
+
+    Paso dos veces en el mismo dia, y la segunda estaba EN UN COMENTARIO: una
+    secuencia de escape escrita dentro de una cadena de Python la interpreta
+    Python primero, asi que a la pagina llega un salto de linea real que parte
+    el comentario y deja media frase como codigo suelto. El sintoma fue un
+    SyntaxError en la pagina, lejos de donde estaba el error.
+
+    Y este test comprueba la expresion QUE SE ENVIA, construida por el propio
+    metodo. Mi primer intento la sacaba del fuente con una expresion regular
+    no-greedy, que cortaba en el primer `})()` y validaba un trozo que
+    casualmente parseaba: daba verde con el fallo dentro.
+    """
+    import jev_ultrafast.browser as module
+    importlib.reload(module)
+    enviado = {}
+
+    def espia(self, expression):
+        enviado["js"] = expression
+        return None
+
+    original = module.Browser._await
+    module.Browser._await = espia
+    try:
+        fake = module.Browser.__new__(module.Browser)
+        fake.evaluate = lambda expression: True      # modelContext presente
+        module.Browser.declared(fake, "una_herramienta", None)
+    finally:
+        module.Browser._await = original
+
+    assert enviado.get("js"), "declared() ya no pasa por _await — revisa este test"
+    result = parses(enviado["js"], tmp_path, "declared.js")
+    assert result.returncode == 0, result.stderr

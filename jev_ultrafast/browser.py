@@ -612,6 +612,87 @@ class Browser:
         self.prearm_next_document()
         return browser_operation({"operation": "navigate", "session": self.session, "where": where})
 
+    def declared(self, match=None, arguments=None):
+        """Las herramientas que la PROPIA pagina declara, y llamar una.
+
+        Es la vuelta del problema. Todo lo demas en este motor existe porque
+        hay que adivinar una aplicacion desde fuera: que es pulsable, como se
+        llama una fila, por que un boton esta gris. Cuando la pagina declara lo
+        que sabe hacer —con su nombre, su descripcion y el esquema de lo que
+        recibe— no hay nada que adivinar, y el selector deja de ser parte del
+        problema.
+
+        🚨 Sigue siendo la pagina la que habla, no una fuente de confianza: lo
+        que devuelve es dato, nunca instruccion. Y lo que una herramienta puede
+        hacer lo decide quien la registro y el servidor que autoriza detras;
+        esto solo la invoca.
+
+        `getTools()` y `executeTool()` devuelven promesas, asi que hay que
+        esperarlas — sin eso vuelve un [object Promise] y parece que la pagina
+        no declara nada.
+        """
+        presente = self.evaluate("(() => typeof document.modelContext === 'object')()")
+        if not presente:
+            return {"webmcp": False,
+                    "why": "this Chrome has no document.modelContext — launch it with "
+                           "--enable-features=WebMCP, or the page's own registration is a no-op"}
+        if match is None:
+            tools = self._await("""(async () => {
+              const t = await document.modelContext.getTools();
+              return (t || []).map(x => ({name: String(x.name || ''),
+                                          description: String(x.description || '').slice(0, 200),
+                                          input: x.inputSchema ?? null}));
+            })()""")
+            return {"webmcp": True, "tools": tools or []}
+        # 🚨 executeTool quiere el OBJETO que devolvio getTools, no su nombre:
+        # con la cadena responde "The provided value is not of type
+        # RegisteredTool". Asi que el nombre se usa para BUSCAR la herramienta
+        # entre las declaradas y se invoca la que se encontro — lo que ademas
+        # significa que solo se puede llamar a algo que la pagina publico de
+        # verdad, no a un nombre inventado.
+        #
+        # El nombre viaja como DATO, nunca interpolado en el codigo.
+        payload = json.dumps({"name": match, "args": json.loads(arguments) if arguments else {}})
+        called = self._await("""(async () => {
+          const ask = %s;
+          const tools = await document.modelContext.getTools();
+          const tool = (tools || []).find(t => String(t.name) === ask.name);
+          if (!tool) return {called: ask.name, error: 'the page does not declare that tool',
+                             available: (tools || []).map(t => String(t.name))};
+          try {
+            // 🚨 Chrome quiere los argumentos como CADENA JSON, no como objeto:
+            // con un objeto responde "Failed to parse input arguments", que
+            // suena a que el esquema no cuadra y en realidad es el envoltorio.
+            const out = await document.modelContext.executeTool(tool, JSON.stringify(ask.args));
+            // Y devuelve otra cadena, con el sobre de MCP dentro. Sin
+            // desenvolverlo lo que llega es un JSON escapado tres veces, que
+            // tecnicamente es la respuesta y en la practica no la lee nadie.
+            let valor = out;
+            try {
+              const sobre = typeof out === 'string' ? JSON.parse(out) : out;
+              // El salto de linea va por codigo a proposito. Esto es JS dentro
+              // de una cadena de Python: una secuencia de escape escrita aqui
+              // la interpreta Python primero, y a la pagina llega un salto
+              // REAL dentro de un literal, que no parsea. Vale hasta para un
+              // comentario como este, que fue justo lo que lo rompio.
+              const texto = sobre?.content?.map?.(c => c?.text ?? '').join(String.fromCharCode(10));
+              if (texto !== undefined) { try { valor = JSON.parse(texto); } catch { valor = texto; } }
+              else valor = sobre;
+            } catch {}
+            return {called: ask.name, result: valor ?? null};
+          } catch (e) { return {called: ask.name, error: String(e && e.message || e)}; }
+        })()""" % payload)
+        return called or {"called": match, "result": None}
+
+    def _await(self, expression):
+        """Un evaluate que espera la promesa, con su error si la rechaza."""
+        response = self.call("Runtime.evaluate", expression=expression,
+                             returnByValue=True, awaitPromise=True)
+        if response.get("exceptionDetails"):
+            detail = response["exceptionDetails"].get("exception", {}).get("description")
+            raise StalePage(detail or "The page rejected the call")
+        return response.get("result", {}).get("value")
+
     def sealed(self, match=None):
         """What is inside the closed components, and press one of them.
 

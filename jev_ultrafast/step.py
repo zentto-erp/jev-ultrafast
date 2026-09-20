@@ -76,7 +76,7 @@ def main(argv=None):
     parser.add_argument("operation", choices=[
         "observe", "keys", "find", "click", "dblclick", "fill", "inspect", "listen", "heard",
         "component", "hold", "hover", "drag", "contextmenu", "touch", "scroll", "key",
-        "arm", "console", "network", "state", "sealed", "upload", "navigate", "highlight",
+        "arm", "console", "network", "state", "sealed", "declared", "upload", "navigate", "highlight",
     ])
     parser.add_argument("--reuse-tab", required=True, help="targetId of the open tab")
     parser.add_argument("--match", help="text of the control, as the observation labelled it")
@@ -118,6 +118,9 @@ def main(argv=None):
             if not args.text:
                 raise SystemExit("state needs --text <file>")
             return browser.state("load" if args.mode == "load" else "save", args.text)
+        if args.operation == "declared":
+            # Lo que la pagina dice saber hacer, y llamar una de esas cosas.
+            return browser.declared(args.match, args.value)
         if args.operation == "sealed":
             # Closed components: list what is inside, or press one.
             return browser.sealed(args.match)
