@@ -86,7 +86,8 @@ def main(argv=None):
                         help="ms between keystrokes; a point of sale reads the rhythm")
     parser.add_argument("--events", help="comma-separated event names")
     parser.add_argument("--member", help="property or method name")
-    parser.add_argument("--mode", default="get", choices=["get", "set", "call", "html5", "pointer", "accept", "dismiss"])
+    parser.add_argument("--mode", default="get",
+                        choices=["get", "set", "call", "html5", "pointer", "accept", "dismiss"])
     parser.add_argument("--value", help="JSON value for component set")
     parser.add_argument("--modifiers", help="comma-separated: alt, ctrl, meta, shift")
     parser.add_argument("--press", type=float, default=0, help="ms to hold a click down")
