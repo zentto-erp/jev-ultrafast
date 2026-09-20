@@ -93,6 +93,86 @@ _ARM_SOURCE = """(() => {
 })()"""
 
 
+_INTERACTIVE_NODES = {"BUTTON", "A", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"}
+
+
+def _attributes(node):
+    """CDP hands attributes back as a flat [name, value, name, value…] list."""
+    flat = node.get("attributes") or []
+    return dict(zip(flat[0::2], flat[1::2]))
+
+
+def _node_text(node, budget=60):
+    """Whatever this node reads as, for naming it."""
+    if node.get("nodeType") == 3:
+        return (node.get("nodeValue") or "").strip()
+    parts = []
+    for child in node.get("children") or []:
+        parts.append(_node_text(child, budget))
+        if sum(len(p) for p in parts) > budget:
+            break
+    return " ".join(p for p in parts if p).strip()
+
+
+def _name_of(node):
+    attrs = _attributes(node)
+    return (attrs.get("aria-label") or _node_text(node) or attrs.get("title")
+            or attrs.get("placeholder") or attrs.get("name") or attrs.get("id") or "")
+
+
+def closed_roots(document_root):
+    """Every closed shadow root, and the controls sealed inside it.
+
+    A closed root is private to script by design: `element.shadowRoot` is null,
+    so the observation — which runs as script in the page — cannot see in, and
+    the content is not merely unreachable but *unreported*. That is the worst
+    shape a blind spot can take: the run answers confidently about a screen
+    whose other half it never knew was there.
+
+    CDP is not script and is not bound by that rule: `DOM.getDocument` with
+    `pierce` returns closed roots like any other. Measured against a
+    deliberately closed root: script said there was no shadow root at all, CDP
+    returned it with the button inside.
+
+    Nothing is opened and nothing is patched. The page behaves exactly as its
+    author intended; this only refuses to pretend the content is not there.
+    """
+    found = []
+
+    def collect(node, into):
+        attrs = _attributes(node)
+        if node.get("nodeName") in _INTERACTIVE_NODES or attrs.get("role") or attrs.get("onclick"):
+            label = _name_of(node)
+            if label or node.get("nodeName") in _INTERACTIVE_NODES:
+                into.append({
+                    "kind": (attrs.get("role") or node.get("nodeName", "")).lower(),
+                    "label": label[:60],
+                    # The handle CDP itself uses. Geometry and clicks resolve
+                    # from it, so nothing here is a selector and nothing is a
+                    # guess about the page's structure.
+                    "backend": node.get("backendNodeId"),
+                })
+        for child in node.get("children") or []:
+            collect(child, into)
+        for root in node.get("shadowRoots") or []:
+            collect(root, into)
+
+    def walk(node, host=""):
+        mine = _name_of(node) or host
+        for root in node.get("shadowRoots") or []:
+            if root.get("shadowRootType") == "closed":
+                inside = []
+                collect(root, inside)
+                found.append({"host": (mine or node.get("nodeName", "")).strip()[:60],
+                              "inside": inside})
+            walk(root, mine)
+        for child in node.get("children") or []:
+            walk(child, mine)
+
+    walk(document_root)
+    return found
+
+
 def _arm_record(target):
     """Where the arming choice for one tab is kept between steps."""
     folder = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp") / "jev-armed"
@@ -531,6 +611,46 @@ class Browser:
         """reload, back, forward, or an http(s) address to open."""
         self.prearm_next_document()
         return browser_operation({"operation": "navigate", "session": self.session, "where": where})
+
+    def sealed(self, match=None):
+        """What is inside the closed components, and press one of them.
+
+        Without `match` it lists them. With it, the first control whose label
+        matches is clicked where it actually is on screen.
+
+        The click goes through `DOM.getBoxModel`, which is CDP asking the
+        renderer for the real rectangle — not a guess, and not a coordinate a
+        model produced. A control with no box is off-screen or not rendered,
+        and that is said rather than clicked at 0,0.
+        """
+        document = self.call("DOM.getDocument", depth=-1, pierce=True)
+        roots = closed_roots(document["root"])
+        if not match:
+            return {"closed_roots": roots,
+                    "note": "script cannot see into these; CDP can. Press one with --match."}
+        wanted = match.strip().lower()
+        for root in roots:
+            for one in root["inside"]:
+                if wanted in (one.get("label") or "").lower():
+                    try:
+                        box = self.call("DOM.getBoxModel", backendNodeId=one["backend"])["model"]
+                    except Exception:
+                        raise StalePage(
+                            f"{one['label']!r} is inside a closed component and has no box "
+                            "on screen — it is not rendered, or it is scrolled away.")
+                    quad = box["content"]
+                    x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+                    y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+                    for event in ("mousePressed", "mouseReleased"):
+                        self.call("Input.dispatchMouseEvent", type=event, x=x, y=y,
+                                  button="left", clickCount=1)
+                    self.wait_until_settled()
+                    return {"pressed": one["label"], "inside": root["host"], "at": [x, y]}
+        raise SystemExit(json.dumps({
+            "error": "not_found",
+            "looked_for": match,
+            "available": [one.get("label") for root in roots for one in root["inside"]][:40],
+        }))
 
     def highlight(self, node):
         """Ring the element for a moment, for whoever is watching the window."""

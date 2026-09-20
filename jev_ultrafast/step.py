@@ -74,9 +74,9 @@ def find(page, text, kind=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="jev-step", description=__doc__)
     parser.add_argument("operation", choices=[
-        "observe", "keys", "click", "dblclick", "fill", "inspect", "listen", "heard",
+        "observe", "keys", "find", "click", "dblclick", "fill", "inspect", "listen", "heard",
         "component", "hold", "hover", "drag", "contextmenu", "touch", "scroll", "key",
-        "arm", "console", "network", "state", "upload", "navigate", "highlight",
+        "arm", "console", "network", "state", "sealed", "upload", "navigate", "highlight",
     ])
     parser.add_argument("--reuse-tab", required=True, help="targetId of the open tab")
     parser.add_argument("--match", help="text of the control, as the observation labelled it")
@@ -118,6 +118,9 @@ def main(argv=None):
             if not args.text:
                 raise SystemExit("state needs --text <file>")
             return browser.state("load" if args.mode == "load" else "save", args.text)
+        if args.operation == "sealed":
+            # Closed components: list what is inside, or press one.
+            return browser.sealed(args.match)
         if args.operation == "navigate":
             # `--text` carries the destination: reload, back, forward, or a URL.
             return browser.navigate(args.text or "reload")
@@ -144,6 +147,42 @@ def main(argv=None):
             }
         if args.operation == "keys":
             return {"url": page["url"], "keys": page.get("keys", [])}
+        if args.operation == "find":
+            # Look for one thing instead of reading the whole screen.
+            #
+            # An observation of a dense screen is a few hundred actions and
+            # thousands of characters of text, and a step that only needs to
+            # know "is there a Confirm button, and can I press it" pays for all
+            # of it. Worse, it pays again on every later turn, because the
+            # answer stays in the conversation — so one careless observation on
+            # a long run is charged hundreds of times over.
+            #
+            # This asks the question and returns the answer.
+            if not args.match:
+                raise SystemExit("find needs --match <text>")
+            wanted = args.match.strip().lower()
+            hits = [{"id": a["id"], "kind": a["kind"], "label": a.get("label")}
+                    for a in page["actions"] if wanted in (a.get("label") or "").lower()]
+            # The three places a control can be, not just the reachable one. A
+            # `find` that answers "no" because the button is disabled, or
+            # because it is only a key, teaches the run the wrong lesson.
+            stopped = [b for b in page.get("blocked", [])
+                       if wanted in (b.get("label") or "").lower()]
+            keys = [k for k in page.get("keys", [])
+                    if wanted in (k.get("label") or "").lower()]
+            # And the page's own words, for what is read rather than pressed:
+            # a total, an error, a status. One line either side is enough to
+            # tell "Saldo 0,00" from "Saldo" as a column heading.
+            lines = (page.get("text") or "").split("\n")
+            around = []
+            for at, line in enumerate(lines):
+                if wanted in line.lower():
+                    around.append("\n".join(lines[max(0, at - 1):at + 2]))
+                    if len(around) >= 5:
+                        break
+            return {"url": page["url"], "looked_for": args.match,
+                    "actions": hits, "blocked": stopped, "keys": keys, "text": around,
+                    "found": bool(hits or stopped or keys or around)}
 
         if args.operation == "scroll":
             target = find(page, args.match, kind="scroll")
