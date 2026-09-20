@@ -356,6 +356,112 @@ def browser_operation(request):
             raise StalePage("That element is no longer in the document")
         return found
 
+    if operation in ("drag", "contextmenu"):
+        # Gestures a menu of actions cannot offer.
+        #
+        # Dragging needs an origin AND a destination: offering one action per
+        # pair would be the cartesian product of everything on screen. So these
+        # are asked for by name, by a caller that knows what it wants to move —
+        # not chosen from a list.
+        #
+        # Both resolve node ids the observation already found, so the same rule
+        # holds as everywhere else: the page never sees a selector written by a
+        # model.
+        def centre(node, what):
+            if type(node) is not int:
+                raise ValueError(f"Invalid observed node for {what}")
+            spot = evaluate("""(node => {
+              const e=window.__jevFast?.nodes.get(node);
+              if (!e?.isConnected || !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))
+                return null;
+              const r=e.getBoundingClientRect();
+              // `display: contents` generates no box: the element is in the
+              // tree and has no geometry, so there is nothing to aim at. Its
+              // children are the real targets.
+              if (!r.width || !r.height) return null;
+              return {x:r.x+r.width/2, y:r.y+r.height/2};
+            })(%s)""" % json.dumps(node))
+            if spot is None:
+                raise StalePage(f"The {what} is gone, hidden, or has no box to aim at")
+            return spot["x"], spot["y"]
+
+        if operation == "contextmenu":
+            x, y = centre(request.get("node"), "target")
+            call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y,
+                 button="right", clickCount=1)
+            call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y,
+                 button="right", clickCount=1)
+            return {"executed": "contextmenu"}
+
+        # HTML5 drag and drop is a different machine from mouse events. An
+        # element with `draggable` listens for dragstart/dragover/drop carrying
+        # a DataTransfer; press-move-release never produces one, so a board
+        # built on it does not move a single card no matter how well aimed the
+        # mouse path is. The events have to be synthesised, sharing one
+        # DataTransfer so what the source writes is what the target reads.
+        if request.get("mode") == "html5":
+            if request.get("to") is None:
+                raise ValueError("An HTML5 drag needs a destination element: pass `to`")
+            moved = evaluate("""(req => {
+              const from=window.__jevFast?.nodes.get(req.node);
+              const to=window.__jevFast?.nodes.get(req.to);
+              if (!from?.isConnected || !to?.isConnected) return null;
+              const data=new DataTransfer();
+              const fire=(el,type,extra)=>{
+                const r=el.getBoundingClientRect();
+                const ev=new DragEvent(type,{bubbles:true,cancelable:true,composed:true,
+                  dataTransfer:data,
+                  clientX:r.x+r.width/2, clientY:r.y+(extra?.atTop ? 2 : r.height/2)});
+                el.dispatchEvent(ev);
+                return ev;
+              };
+              fire(from,'dragstart');
+              fire(to,'dragenter');
+              // The insertion index usually comes from the LAST dragover, so
+              // the one that counts is the one just before the drop.
+              fire(to,'dragover',{atTop:req.atTop});
+              const dropped=fire(to,'drop',{atTop:req.atTop});
+              fire(from,'dragend');
+              return {dropped:dropped.defaultPrevented};
+            })(%s)""" % json.dumps({k: request.get(k) for k in ("node", "to", "atTop")}))
+            if moved is None:
+                raise StalePage("One end of the drag is no longer in the document")
+            # A handler that accepts a drop calls preventDefault. Without it the
+            # events fired and nobody listened, which is not a move.
+            if not moved["dropped"]:
+                raise RuntimeError("Nothing accepted the drop; the target may not be a drop zone.")
+            return {"executed": "drag", "mode": "html5"}
+
+        start = centre(request.get("node"), "drag origin")
+        if request.get("to") is not None:
+            end = centre(request["to"], "drag destination")
+        else:
+            end = (start[0] + float(request.get("dx", 0)), start[1] + float(request.get("dy", 0)))
+        if end == start:
+            raise ValueError("A drag needs a destination: pass `to`, or dx/dy")
+
+        # Intermediate points are not padding. A timeline computes the new date
+        # from the delta of each move, a board decides the insertion index from
+        # the LAST dragover, and a drag with no movement between press and
+        # release is read as a click. Steps make it a drag.
+        steps = max(2, int(request.get("steps", 8)))
+        path = [(start[0] + (end[0] - start[0]) * i / steps,
+                 start[1] + (end[1] - start[1]) * i / steps) for i in range(1, steps + 1)]
+
+        call("Input.dispatchMouseEvent", type="mousePressed", x=start[0], y=start[1],
+             button="left", clickCount=1)
+        try:
+            for x, y in path:
+                call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y, button="left")
+                # A component that captures the pointer and recalculates on each
+                # move needs time to do it; firing the whole path in one tick
+                # lands every event on the same frame.
+                time.sleep(0.02)
+        finally:
+            call("Input.dispatchMouseEvent", type="mouseReleased", x=path[-1][0], y=path[-1][1],
+                 button="left", clickCount=1)
+        return {"executed": "drag", "from": list(start), "to": list(path[-1])}
+
     if operation == "hold":
         # Some behaviour exists only while a key is DOWN: Alt revealing the code
         # under a name, Ctrl showing the shortcuts of the screen. A press and a

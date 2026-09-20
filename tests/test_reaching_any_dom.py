@@ -102,10 +102,22 @@ def test_frame_text_counts_as_page_text():
 
 # ─── Asking instead of acting ──────────────────────────────────────────────
 
+def inspect_block():
+    """Just the inspect branch.
+
+    Cut at the NEXT `if operation`, whatever it is — cutting at `act` assumed
+    the two were adjacent, and the moment another operation was added in
+    between, this test started reading somebody else's mouse events.
+    """
+    source = browser_source()
+    body = source.split('if operation == "inspect"')[1]
+    following = body.find("\n    if operation")
+    return body[:following] if following != -1 else body
+
+
 def test_inspect_exists_and_is_read_only():
     """Verifying must not change what is being verified."""
-    source = browser_source()
-    inspect = source.split('if operation == "inspect"')[1].split('if operation == "act"')[0]
+    inspect = inspect_block()
     assert "getBoundingClientRect" in inspect
     for mutation in ("Input.dispatchMouseEvent", "Page.navigate", "insertText", ".click()"):
         assert mutation not in inspect, f"inspect must not {mutation}"
@@ -113,23 +125,20 @@ def test_inspect_exists_and_is_read_only():
 
 def test_inspect_refuses_anything_but_an_observed_node():
     """Node ids are code-owned; a model-supplied selector must never reach the page."""
-    source = browser_source()
-    inspect = source.split('if operation == "inspect"')[1].split('if operation == "act"')[0]
+    inspect = inspect_block()
     assert "if type(node) is not int:" in inspect
     assert "Invalid observed node" in inspect
 
 
 def test_inspect_reports_a_vanished_element_instead_of_guessing():
     """Silence would let a check pass against an element that is no longer there."""
-    source = browser_source()
-    inspect = source.split('if operation == "inspect"')[1].split('if operation == "act"')[0]
+    inspect = inspect_block()
     assert "StalePage" in inspect
 
 
 def test_inspect_returns_more_than_the_observation_carries():
     """Its reason to exist is the value the capped observation left out."""
-    source = browser_source()
-    inspect = source.split('if operation == "inspect"')[1].split('if operation == "act"')[0]
+    inspect = inspect_block()
     for field in ("text", "value", "checked", "disabled", "visible", "attributes"):
         assert f"{field}:" in inspect
 

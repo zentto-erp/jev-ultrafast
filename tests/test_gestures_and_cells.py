@@ -179,3 +179,69 @@ def test_blocked_has_its_own_budget():
     source = snapshot_source()
     assert "MAX_BLOCKED=budget('blocked',12)" in source
     assert "blocked.length<MAX_BLOCKED" in source
+
+
+# ─── Dragging, and the two machines that do it ─────────────────────────────
+
+def test_drag_is_an_operation_not_a_menu_entry():
+    """One action per origin-destination pair is the cartesian product of the page."""
+    source = browser_source()
+    assert 'if operation in ("drag", "contextmenu"):' in source
+
+
+def test_a_pointer_drag_has_intermediate_points():
+    """A timeline computes the new date from the delta of each move."""
+    source = browser_source()
+    drag = source.split('if operation in ("drag", "contextmenu"):')[1]
+    assert "steps" in drag
+    assert "mouseMoved" in drag
+    assert "max(2, int(request.get(\"steps\", 8)))" in drag
+
+
+def test_a_drag_always_releases_the_button():
+    """A button left down makes every later click land on the wrong element."""
+    source = browser_source()
+    drag = source.split('if operation in ("drag", "contextmenu"):')[1]
+    assert "finally:" in drag
+    assert "mouseReleased" in drag
+
+
+def test_a_drag_with_no_destination_is_refused():
+    source = browser_source()
+    assert "A drag needs a destination" in source
+
+
+def test_html5_drag_is_a_separate_machine():
+    """`draggable` listens for DragEvent; press-move-release never produces one."""
+    source = browser_source()
+    assert 'request.get("mode") == "html5"' in source
+    assert "new DataTransfer()" in source
+    assert "dragstart" in source and "dragover" in source and "drop" in source
+
+
+def test_html5_drag_shares_one_datatransfer():
+    """What the source writes has to be what the target reads."""
+    source = browser_source()
+    html5 = source.split('request.get("mode") == "html5"')[1]
+    assert html5.count("new DataTransfer()") == 1
+    assert "dataTransfer:data" in html5
+
+
+def test_html5_drag_checks_somebody_accepted_it():
+    """Firing events nobody listens to is not a move."""
+    source = browser_source()
+    assert "defaultPrevented" in source
+    assert "Nothing accepted the drop" in source
+
+
+def test_right_click_uses_the_right_button():
+    """Without it the context menu of a timeline is unreachable."""
+    source = browser_source()
+    assert 'button="right"' in source
+
+
+def test_an_element_without_a_box_is_refused():
+    """`display: contents` is in the tree and has no geometry to aim at."""
+    source = browser_source()
+    assert "if (!r.width || !r.height) return null;" in source
+    assert "no box to aim at" in source

@@ -165,7 +165,28 @@ observation, after the page settles.
 
 ---
 
-## 8. Settling
+## 8. Changing module can be a full page load
+
+An application assembled from micro-frontends is not one SPA. Each module is a
+separate build with its own base path, and moving between them is
+`window.location.assign`, not a client-side route change.
+
+Everything resets: the document is new, and **every node id from the previous
+observation is dead**. A run that remembered "the confirm button is node 42" and
+then changed module is holding a number that means nothing.
+
+- **Here:** the marker carries `performance.timeOrigin`, which changes on a real
+  navigation, so a full load is distinguishable from a route change. Node ids
+  are dropped when the element leaves the document.
+- **Anywhere else:** re-query after navigating. Never carry a handle across it,
+  and wait for a load, not for a route.
+
+The same applies to anything that remounts the tree: switching company, changing
+tenant, or a language change that reloads.
+
+---
+
+## 9. Settling
 
 `readyState === "complete"` arrives **before** the render with data. Observing
 there reads the shell: measured at 924 ms on a screen whose table was already
@@ -175,7 +196,7 @@ Wait for the DOM to stop changing, not for the document to finish loading.
 
 ---
 
-## 9. Budgets are policy
+## 10. Budgets are policy
 
 250 actions and 6000 characters of text are generous for a page and tight for a
 dense table. When they run out, the run reports one screenful as if it were
