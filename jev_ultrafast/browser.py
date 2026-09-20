@@ -19,6 +19,23 @@ _MODIFIER_BITS = {name.lower(): bit for name, _code, bit in MODIFIERS}
 _MODIFIER_BITS.update({"ctrl": 2, "cmd": 4, "command": 4, "option": 1, "opt": 1})
 
 
+def member_name(raw):
+    """The property or method to reach on an element, checked before it travels.
+
+    It arrives as a NAME and is used as a property name, never evaluated. The
+    check is what keeps it that way: anything that is not a plain identifier —
+    a path, a call, a semicolon — is refused here rather than being sent to the
+    page and hoping it means nothing there.
+    """
+    if not isinstance(raw, str) or not raw.isidentifier():
+        raise ValueError("`member` must be a plain property or method name")
+    # Reaching the prototype plumbing is never the point and is how a name stops
+    # being just a name.
+    if raw.startswith("__") or raw in {"constructor", "prototype"}:
+        raise ValueError(f"`member` cannot be {raw!r}")
+    return raw
+
+
 def modifier_mask(names):
     """Turn ["ctrl", "alt"] into the bitmask CDP expects.
 
@@ -355,6 +372,99 @@ def browser_operation(request):
         if found is None:
             raise StalePage("That element is no longer in the document")
         return found
+
+    if operation == "component":
+        # Some state has no attribute and no control.
+        #
+        # A custom element takes its rows, its tasks, its layout as JS
+        # properties — arrays and objects with no attribute equivalent. There is
+        # no gesture that sets them, so a run cannot arrange the state it wants
+        # to test, and cannot read the state it should verify. The application
+        # itself does this: it reads a designer's layout with getLayout().
+        #
+        # Names only. The property or method is named, the arguments are JSON;
+        # nothing here evaluates an expression written by a model, so the same
+        # rule holds as for node ids — the page never runs model text.
+        node = request.get("node")
+        member = request.get("member")
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        member = member_name(member)
+        payload = {"node": node, "member": member, "mode": request.get("mode", "get"),
+                   "args": request.get("args") or [], "value": request.get("value")}
+        if payload["mode"] not in ("get", "set", "call"):
+            raise ValueError("`mode` must be get, set or call")
+        result = evaluate("""(req => {
+          const e=window.__jevFast?.nodes.get(req.node);
+          if (!e?.isConnected) return {missing:true};
+          // Own prototype chain only: no reaching into globals through a name.
+          if (!(req.member in e)) return {unknown:true};
+          try {
+            if (req.mode === 'set') { e[req.member] = req.value; return {ok:true}; }
+            const value = req.mode === 'call' ? e[req.member](...req.args) : e[req.member];
+            // Whatever comes back is data from the page. Serialised, capped,
+            // never handed on as something to run.
+            let shown;
+            try { shown = JSON.stringify(value ?? null); }
+            catch { shown = String(value).slice(0, 2000); }
+            return {ok:true, value: shown === undefined ? null : String(shown).slice(0, 8000)};
+          } catch (err) { return {failed: String(err?.message || err).slice(0, 300)}; }
+        })(%s)""" % json.dumps(payload))
+        if not result or result.get("missing"):
+            raise StalePage("That element is no longer in the document")
+        if result.get("unknown"):
+            raise ValueError(f"The element has no member named {member!r}")
+        if result.get("failed"):
+            raise RuntimeError(f"{member} raised: {result['failed']}")
+        return {"member": member, "value": result.get("value")}
+
+    if operation == "listen":
+        # Verification by effect, not by action.
+        #
+        # "The click did not raise an error" is the weakest claim a run can
+        # make. Re-reading the DOM is better but still indirect: a board that
+        # moved a card and a board that re-rendered for another reason look the
+        # same from outside.
+        #
+        # Components say what happened. They emit CustomEvents — card-move,
+        # task-change, render-complete, save-error — and the ones worth
+        # listening to are `composed`, so they cross the shadow boundary and
+        # arrive at the document. Recording them around an action turns "it
+        # probably worked" into "the component says it did".
+        names = request.get("events") or []
+        if not names or not all(isinstance(n, str) and n.strip() for n in names):
+            raise ValueError("Pass `events` as a list of event names to record")
+        # Names only reach addEventListener; nothing here evaluates model text.
+        call("Runtime.evaluate", expression="""(names => {
+          const box = window.__jevHeard ||= {seen:[], stop:[]};
+          for (const off of box.stop) off();
+          box.stop = []; box.seen = [];
+          for (const name of names) {
+            const handler = (event) => {
+              // The detail is data from the page: recorded, never executed, and
+              // capped so one chatty event cannot fill the observation.
+              let detail = null;
+              try { detail = JSON.stringify(event.detail ?? null)?.slice(0, 2000) ?? null; }
+              catch { detail = '[unserialisable]'; }
+              box.seen.push({name: event.type, detail, at: Math.round(performance.now())});
+              if (box.seen.length > 50) box.seen.shift();
+            };
+            document.addEventListener(name, handler, true);
+            box.stop.push(() => document.removeEventListener(name, handler, true));
+          }
+          return names.length;
+        })(%s)""" % json.dumps([n.strip() for n in names]), returnByValue=True)
+        return {"listening": [n.strip() for n in names]}
+
+    if operation == "heard":
+        # What arrived since `listen`. Empty is an answer: it means the gesture
+        # reached the page and the component did not consider anything to have
+        # happened — which is exactly the silent failure that re-reading the DOM
+        # tends to miss.
+        seen = evaluate("(() => (window.__jevHeard?.seen ?? []))()")
+        if request.get("clear"):
+            call("Runtime.evaluate", expression="(() => { if (window.__jevHeard) window.__jevHeard.seen = []; })()")
+        return {"events": seen or []}
 
     if operation == "touch":
         # Touch or mouse is not a property of the run, it is a property of the
