@@ -262,6 +262,11 @@ def snapshot_budgets():
     return chosen
 
 
+def harvest_script():
+    """El script que descubre lo que la pagina repite."""
+    return (Path(__file__).parent / "harvest.js").read_text(encoding="utf-8")
+
+
 def read_state_script():
     """The observation, with this run's budgets attached."""
     source = Path(__file__).with_name("snapshot.js").read_text()
@@ -692,6 +697,35 @@ class Browser:
             detail = response["exceptionDetails"].get("exception", {}).get("description")
             raise StalePage(detail or "The page rejected the call")
         return response.get("result", {}).get("value")
+
+    def harvest(self, match=None):
+        """Lo que la pantalla repite, como datos.
+
+        Una lista de mercados, una tabla de precios, un tablero de noticias: en
+        cuanto una pagina enseña muchas cosas del mismo tipo, lo que interesa ya
+        no es que se puede pulsar sino QUE DICE, y el que pregunta las quiere
+        todas, en una estructura que pueda recorrer un programa.
+
+        `match` filtra por texto y se aplica DENTRO de cada grupo, no sobre el
+        resultado: quedarse con el grupo entero y filtrar despues devolveria
+        una lista de cuarenta para entregar dos.
+
+        🚨 Solo lee. No pulsa, no escribe y no manda nada a ningun sitio.
+        """
+        data = self.evaluate(harvest_script())
+        if not data:
+            return {"groups": []}
+        wanted = (match or "").strip().lower()
+        if wanted:
+            kept = []
+            for group in data.get("groups", []):
+                items = [one for one in group.get("items", [])
+                         if wanted in " ".join(one.get("text", [])).lower()]
+                if items:
+                    kept.append({**group, "items": items, "shown": len(items)})
+            data["groups"] = kept
+            data["matched"] = match
+        return data
 
     def sealed(self, match=None):
         """What is inside the closed components, and press one of them.

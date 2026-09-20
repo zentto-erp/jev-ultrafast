@@ -78,7 +78,7 @@ def main(argv=None):
     parser.add_argument("operation", choices=[
         "observe", "keys", "find", "click", "dblclick", "fill", "inspect", "listen", "heard",
         "component", "hold", "hover", "drag", "contextmenu", "touch", "scroll", "key",
-        "arm", "console", "network", "state", "sealed", "declared", "replay",
+        "arm", "console", "network", "state", "sealed", "declared", "harvest", "replay",
         "upload", "navigate", "highlight",
     ])
     parser.add_argument("--reuse-tab", required=True, help="targetId of the open tab")
@@ -127,6 +127,9 @@ def main(argv=None):
             if not args.text:
                 raise SystemExit("replay needs --text <summary.json o guion.json>")
             return run_script(browser, script_from(args.text), find)
+        if args.operation == "harvest":
+            # Lo que la pantalla repite, como datos. `--match` filtra por texto.
+            return browser.harvest(args.match)
         if args.operation == "declared":
             # Lo que la pagina dice saber hacer, y llamar una de esas cosas.
             return browser.declared(args.match, args.value)
