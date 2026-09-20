@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -9,8 +10,85 @@ from pathlib import Path
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
+
+# CDP modifier bits: Alt 1, Ctrl 2, Meta 4, Shift 8.
+MODIFIERS = (("Alt", "AltLeft", 1), ("Control", "ControlLeft", 2),
+             ("Meta", "MetaLeft", 4), ("Shift", "ShiftLeft", 8))
+_MODIFIER_BITS = {name.lower(): bit for name, _code, bit in MODIFIERS}
+# What people call them. `cmd` and `option` are the Mac names for the same keys.
+_MODIFIER_BITS.update({"ctrl": 2, "cmd": 4, "command": 4, "option": 1, "opt": 1})
+
+
+def member_name(raw):
+    """The property or method to reach on an element, checked before it travels.
+
+    It arrives as a NAME and is used as a property name, never evaluated. The
+    check is what keeps it that way: anything that is not a plain identifier —
+    a path, a call, a semicolon — is refused here rather than being sent to the
+    page and hoping it means nothing there.
+    """
+    if not isinstance(raw, str) or not raw.isidentifier():
+        raise ValueError("`member` must be a plain property or method name")
+    # Reaching the prototype plumbing is never the point and is how a name stops
+    # being just a name.
+    if raw.startswith("__") or raw in {"constructor", "prototype"}:
+        raise ValueError(f"`member` cannot be {raw!r}")
+    return raw
+
+
+def modifier_mask(names):
+    """Turn ["ctrl", "alt"] into the bitmask CDP expects.
+
+    Unknown names are refused rather than ignored: a run that asks for
+    `ctrl+shift` and silently gets a plain click reports a pass for a gesture
+    that never happened, which is worse than failing.
+    """
+    if not names:
+        return 0
+    if isinstance(names, str):
+        names = [names]
+    mask = 0
+    for name in names:
+        bit = _MODIFIER_BITS.get(str(name).strip().lower())
+        if bit is None:
+            raise ValueError(f"Unknown modifier {name!r}; use alt, ctrl, meta or shift")
+        mask |= bit
+    return mask
+
+
+def snapshot_budgets():
+    """Caps the observation applies, overridable per run.
+
+    The defaults are the historical ones. They are generous for an ordinary page
+    and tight for a dense enterprise table, where the run can hit them long
+    before the page is exhausted and report one screenful as if it were all
+    there is. A value that is not a positive number is ignored rather than
+    obeyed: a typo must not silently remove a cap.
+    """
+    names = {"actions": "JEV_MAX_ACTIONS", "text": "JEV_MAX_TEXT",
+             "scrollers": "JEV_MAX_SCROLLERS"}
+    chosen = {}
+    for key, variable in names.items():
+        raw = os.environ.get(variable)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            chosen[key] = value
+    return chosen
+
+
+def read_state_script():
+    """The observation, with this run's budgets attached."""
+    source = Path(__file__).with_name("snapshot.js").read_text()
+    return f"(() => {{ window.__jevBudgets={json.dumps(snapshot_budgets())}; return {source}; }})()"
+
+
 # Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+READ_STATE = read_state_script()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
 class StalePage(ValueError):
@@ -262,11 +340,344 @@ def browser_operation(request):
             raise StalePage("Document changed during evaluation")
         return result.get("result", {}).get("value")
 
+    if operation == "inspect":
+        # Asking instead of acting. The observation is capped and summarised —
+        # by design, or every step would carry the whole page — so the value a
+        # check depends on may simply not be in it. Without a way to ask, a run
+        # can only report that it clicked Save, never that the record exists.
+        #
+        # Read-only: it resolves a node the observation already found and
+        # returns what it holds. It cannot navigate, type or click, so it can be
+        # used freely to verify without changing what is being verified.
+        node = request.get("node")
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        found = evaluate("""(node => {
+          const e=window.__jevFast?.nodes.get(node);
+          if (!e?.isConnected) return null;
+          const r=e.getBoundingClientRect();
+          const attrs={};
+          for (const a of e.attributes||[]) attrs[a.name]=a.value.slice(0,200);
+          return {
+            tag:e.tagName.toLowerCase(),
+            text:(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,4000),
+            value:'value' in e ? String(e.value) : null,
+            checked:e.checked??null,
+            disabled:e.matches(':disabled'),
+            visible:e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}),
+            rect:{x:r.x,y:r.y,w:r.width,h:r.height},
+            attributes:attrs,
+          };
+        })(%s)""" % json.dumps(node))
+        if found is None:
+            raise StalePage("That element is no longer in the document")
+        return found
+
+    if operation == "component":
+        # Some state has no attribute and no control.
+        #
+        # A custom element takes its rows, its tasks, its layout as JS
+        # properties — arrays and objects with no attribute equivalent. There is
+        # no gesture that sets them, so a run cannot arrange the state it wants
+        # to test, and cannot read the state it should verify. The application
+        # itself does this: it reads a designer's layout with getLayout().
+        #
+        # Names only. The property or method is named, the arguments are JSON;
+        # nothing here evaluates an expression written by a model, so the same
+        # rule holds as for node ids — the page never runs model text.
+        node = request.get("node")
+        member = request.get("member")
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        member = member_name(member)
+        payload = {"node": node, "member": member, "mode": request.get("mode", "get"),
+                   "args": request.get("args") or [], "value": request.get("value")}
+        if payload["mode"] not in ("get", "set", "call"):
+            raise ValueError("`mode` must be get, set or call")
+        result = evaluate("""(req => {
+          const e=window.__jevFast?.nodes.get(req.node);
+          if (!e?.isConnected) return {missing:true};
+          // Own prototype chain only: no reaching into globals through a name.
+          if (!(req.member in e)) return {unknown:true};
+          try {
+            if (req.mode === 'set') { e[req.member] = req.value; return {ok:true}; }
+            const value = req.mode === 'call' ? e[req.member](...req.args) : e[req.member];
+            // Whatever comes back is data from the page. Serialised, capped,
+            // never handed on as something to run.
+            let shown;
+            try { shown = JSON.stringify(value ?? null); }
+            catch { shown = String(value).slice(0, 2000); }
+            return {ok:true, value: shown === undefined ? null : String(shown).slice(0, 8000)};
+          } catch (err) { return {failed: String(err?.message || err).slice(0, 300)}; }
+        })(%s)""" % json.dumps(payload))
+        if not result or result.get("missing"):
+            raise StalePage("That element is no longer in the document")
+        if result.get("unknown"):
+            raise ValueError(f"The element has no member named {member!r}")
+        if result.get("failed"):
+            raise RuntimeError(f"{member} raised: {result['failed']}")
+        return {"member": member, "value": result.get("value")}
+
+    if operation == "listen":
+        # Verification by effect, not by action.
+        #
+        # "The click did not raise an error" is the weakest claim a run can
+        # make. Re-reading the DOM is better but still indirect: a board that
+        # moved a card and a board that re-rendered for another reason look the
+        # same from outside.
+        #
+        # Components say what happened. They emit CustomEvents — card-move,
+        # task-change, render-complete, save-error — and the ones worth
+        # listening to are `composed`, so they cross the shadow boundary and
+        # arrive at the document. Recording them around an action turns "it
+        # probably worked" into "the component says it did".
+        names = request.get("events") or []
+        if not names or not all(isinstance(n, str) and n.strip() for n in names):
+            raise ValueError("Pass `events` as a list of event names to record")
+        # Names only reach addEventListener; nothing here evaluates model text.
+        call("Runtime.evaluate", expression="""(names => {
+          const box = window.__jevHeard ||= {seen:[], stop:[]};
+          for (const off of box.stop) off();
+          box.stop = []; box.seen = [];
+          for (const name of names) {
+            const handler = (event) => {
+              // The detail is data from the page: recorded, never executed, and
+              // capped so one chatty event cannot fill the observation.
+              let detail = null;
+              try { detail = JSON.stringify(event.detail ?? null)?.slice(0, 2000) ?? null; }
+              catch { detail = '[unserialisable]'; }
+              box.seen.push({name: event.type, detail, at: Math.round(performance.now())});
+              if (box.seen.length > 50) box.seen.shift();
+            };
+            document.addEventListener(name, handler, true);
+            box.stop.push(() => document.removeEventListener(name, handler, true));
+          }
+          return names.length;
+        })(%s)""" % json.dumps([n.strip() for n in names]), returnByValue=True)
+        return {"listening": [n.strip() for n in names]}
+
+    if operation == "heard":
+        # What arrived since `listen`. Empty is an answer: it means the gesture
+        # reached the page and the component did not consider anything to have
+        # happened — which is exactly the silent failure that re-reading the DOM
+        # tends to miss.
+        seen = evaluate("(() => (window.__jevHeard?.seen ?? []))()")
+        if request.get("clear"):
+            call("Runtime.evaluate", expression="(() => { if (window.__jevHeard) window.__jevHeard.seen = []; })()")
+        return {"events": seen or []}
+
+    if operation == "touch":
+        # Touch or mouse is not a property of the run, it is a property of the
+        # STEP. An application that branches on pointer type renders a different
+        # tree for each: with touch on, an on-screen keypad appears and HTML5
+        # drag disappears; with it off, the reverse. Choosing once per session
+        # means half the product is untestable, so it is switchable.
+        on = bool(request.get("enabled", True))
+        call("Emulation.setTouchEmulationEnabled", enabled=on,
+             maxTouchPoints=int(request.get("points", 1)) if on else 1)
+        call("Emulation.setEmitTouchEventsForMouse", enabled=on,
+             configuration="mobile" if on else "desktop")
+        return {"touch": on}
+
+    if operation == "hover":
+        # Hovering is not standing still. A tooltip that listens for mousemove
+        # never fires if the pointer is teleported to its centre, and a control
+        # revealed at `opacity: 0` stays invisible to anything reading pixels —
+        # while being perfectly clickable, which is how a run ends up reporting
+        # that it clicked something nobody can see.
+        node = request.get("node")
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        spot = evaluate("""(node => {
+          const e=window.__jevFast?.nodes.get(node);
+          if (!e?.isConnected) return null;
+          const r=e.getBoundingClientRect();
+          if (!r.width || !r.height) return null;
+          return {x:r.x+r.width/2, y:r.y+r.height/2};
+        })(%s)""" % json.dumps(node))
+        if spot is None:
+            raise StalePage("That element is gone or has no box to hover")
+        # Approach from slightly off, then settle: two real moves, because one
+        # event at the destination is indistinguishable from never having moved.
+        for x, y in ((spot["x"] - 12, spot["y"] - 12), (spot["x"], spot["y"])):
+            call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+            time.sleep(0.03)
+        time.sleep(float(request.get("settle", 0.25)))
+        return {"hovered": node}
+
+    if operation in ("drag", "contextmenu"):
+        # Gestures a menu of actions cannot offer.
+        #
+        # Dragging needs an origin AND a destination: offering one action per
+        # pair would be the cartesian product of everything on screen. So these
+        # are asked for by name, by a caller that knows what it wants to move —
+        # not chosen from a list.
+        #
+        # Both resolve node ids the observation already found, so the same rule
+        # holds as everywhere else: the page never sees a selector written by a
+        # model.
+        def centre(node, what):
+            if type(node) is not int:
+                raise ValueError(f"Invalid observed node for {what}")
+            spot = evaluate("""(node => {
+              const e=window.__jevFast?.nodes.get(node);
+              if (!e?.isConnected || !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))
+                return null;
+              const r=e.getBoundingClientRect();
+              // `display: contents` generates no box: the element is in the
+              // tree and has no geometry, so there is nothing to aim at. Its
+              // children are the real targets.
+              if (!r.width || !r.height) return null;
+              return {x:r.x+r.width/2, y:r.y+r.height/2};
+            })(%s)""" % json.dumps(node))
+            if spot is None:
+                raise StalePage(f"The {what} is gone, hidden, or has no box to aim at")
+            return spot["x"], spot["y"]
+
+        if operation == "contextmenu":
+            x, y = centre(request.get("node"), "target")
+            call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y,
+                 button="right", clickCount=1)
+            call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y,
+                 button="right", clickCount=1)
+            return {"executed": "contextmenu"}
+
+        # HTML5 drag and drop is a different machine from mouse events. An
+        # element with `draggable` listens for dragstart/dragover/drop carrying
+        # a DataTransfer; press-move-release never produces one, so a board
+        # built on it does not move a single card no matter how well aimed the
+        # mouse path is. The events have to be synthesised, sharing one
+        # DataTransfer so what the source writes is what the target reads.
+        if request.get("mode") == "html5":
+            if request.get("to") is None:
+                raise ValueError("An HTML5 drag needs a destination element: pass `to`")
+            moved = evaluate("""(req => {
+              const from=window.__jevFast?.nodes.get(req.node);
+              const to=window.__jevFast?.nodes.get(req.to);
+              if (!from?.isConnected || !to?.isConnected) return null;
+              const data=new DataTransfer();
+              const fire=(el,type,extra)=>{
+                const r=el.getBoundingClientRect();
+                const ev=new DragEvent(type,{bubbles:true,cancelable:true,composed:true,
+                  dataTransfer:data,
+                  clientX:r.x+r.width/2, clientY:r.y+(extra?.atTop ? 2 : r.height/2)});
+                el.dispatchEvent(ev);
+                return ev;
+              };
+              fire(from,'dragstart');
+              fire(to,'dragenter');
+              // The insertion index usually comes from the LAST dragover, so
+              // the one that counts is the one just before the drop.
+              fire(to,'dragover',{atTop:req.atTop});
+              const dropped=fire(to,'drop',{atTop:req.atTop});
+              fire(from,'dragend');
+              return {dropped:dropped.defaultPrevented};
+            })(%s)""" % json.dumps({k: request.get(k) for k in ("node", "to", "atTop")}))
+            if moved is None:
+                raise StalePage("One end of the drag is no longer in the document")
+            # A handler that accepts a drop calls preventDefault. Without it the
+            # events fired and nobody listened, which is not a move.
+            if not moved["dropped"]:
+                raise RuntimeError("Nothing accepted the drop; the target may not be a drop zone.")
+            return {"executed": "drag", "mode": "html5"}
+
+        start = centre(request.get("node"), "drag origin")
+        if request.get("to") is not None:
+            end = centre(request["to"], "drag destination")
+        else:
+            end = (start[0] + float(request.get("dx", 0)), start[1] + float(request.get("dy", 0)))
+        if end == start:
+            raise ValueError("A drag needs a destination: pass `to`, or dx/dy")
+
+        # Intermediate points are not padding. A timeline computes the new date
+        # from the delta of each move, a board decides the insertion index from
+        # the LAST dragover, and a drag with no movement between press and
+        # release is read as a click. Steps make it a drag.
+        steps = max(2, int(request.get("steps", 8)))
+        path = [(start[0] + (end[0] - start[0]) * i / steps,
+                 start[1] + (end[1] - start[1]) * i / steps) for i in range(1, steps + 1)]
+
+        call("Input.dispatchMouseEvent", type="mousePressed", x=start[0], y=start[1],
+             button="left", clickCount=1)
+        try:
+            for x, y in path:
+                call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y, button="left")
+                # A component that captures the pointer and recalculates on each
+                # move needs time to do it; firing the whole path in one tick
+                # lands every event on the same frame.
+                time.sleep(0.02)
+        finally:
+            call("Input.dispatchMouseEvent", type="mouseReleased", x=path[-1][0], y=path[-1][1],
+                 button="left", clickCount=1)
+        return {"executed": "drag", "from": list(start), "to": list(path[-1])}
+
+    if operation == "hold":
+        # Some behaviour exists only while a key is DOWN: Alt revealing the code
+        # under a name, Ctrl showing the shortcuts of the screen. A press and a
+        # release with nothing in between observes the page as it was, so the
+        # feature reads as absent and the run reports a failure that is its own.
+        #
+        # Press, observe, release — one operation. Splitting it into two calls
+        # would leave the key held between them, and any later step would run
+        # inside a modifier nobody remembers pressing.
+        held = modifier_mask(request.get("modifiers"))
+        if not held:
+            raise ValueError("Nothing to hold; pass modifiers such as ['alt']")
+        pressed = []
+        try:
+            for name, code, bit in MODIFIERS:
+                if held & bit:
+                    call("Input.dispatchKeyEvent", type="rawKeyDown", key=name,
+                         code=code, modifiers=held)
+                    pressed.append((name, code))
+            # Some of these appear after a deliberate delay — the shortcut hint
+            # waits 450 ms so it does not flash on every copy-paste. Observing
+            # immediately would miss exactly what we came to see.
+            time.sleep(float(request.get("settle", 0.8)))
+            seen = evaluate(READ_STATE)
+        finally:
+            for name, code in reversed(pressed):
+                call("Input.dispatchKeyEvent", type="keyUp", key=name, code=code)
+        if seen is None:
+            raise StalePage("The document changed while the key was held")
+        return seen
+
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            node = action.get("node")
+            if node is None:
+                # Page scroll. The fixed point is arbitrary but harmless: with
+                # nothing scrollable under it the wheel falls through to the
+                # document, which is what this branch means.
+                call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650,
+                     deltaX=0, deltaY=action["delta"])
+            else:
+                if type(node) is not int:
+                    raise ValueError("Invalid observed node")
+                # Aimed at the container the observation found, not at a guessed
+                # point. A wheel event at a fixed coordinate scrolls whatever
+                # happens to sit there — on a page that does not scroll, often
+                # nothing at all, and the agent reads that as "the list ends
+                # here". Setting scrollTop asks the element directly, and the
+                # return value says whether it actually moved, so a container
+                # already at its end cannot be mistaken for a working scroll.
+                moved = evaluate("""(action => {
+                  const e=window.__jevFast?.nodes.get(action.node);
+                  if (!e?.isConnected || !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))
+                    return null;
+                  const sideways=action.axis==='x';
+                  const before=sideways ? e.scrollLeft : e.scrollTop;
+                  if (sideways) e.scrollLeft=before+action.delta;
+                  else e.scrollTop=before+action.delta;
+                  const after=sideways ? e.scrollLeft : e.scrollTop;
+                  return {moved:after!==before,before,after};
+                })(%s)""" % json.dumps({k: action.get(k) for k in ("node", "delta", "axis")}))
+                if moved is None:
+                    raise StalePage("The container is gone or hidden")
+                if not moved["moved"]:
+                    raise RuntimeError("The container did not move; it is already at that end.")
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -310,8 +721,57 @@ def browser_operation(request):
                 raise StalePage("Target changed or is covered. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
-                for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+                # Holding a modifier is a gesture, not decoration. Applications
+                # hang real behaviour on it: Alt to reveal the code under a
+                # name, Ctrl to show the shortcuts of the screen, Shift to
+                # extend a selection, Ctrl-click to open in a new tab. Without
+                # this the agent cannot reach any of it — and cannot verify a
+                # feature whose whole point is the key being down.
+                #
+                # The modifier is pressed, the click happens inside it, and it
+                # is released in a `finally`: leaving Ctrl stuck down poisons
+                # every later step of the run, and that failure looks like the
+                # page misbehaving rather than the driver.
+                held = modifier_mask(action.get("modifiers"))
+                pressed = []
+                try:
+                    for name, code, bit in MODIFIERS:
+                        if held & bit:
+                            call("Input.dispatchKeyEvent", type="rawKeyDown", key=name,
+                                 code=code, modifiers=held)
+                            pressed.append((name, code))
+                    # A grid that edits in place opens its editor on the SECOND
+                    # click. Sending one leaves the cell exactly as it was, so
+                    # the whole capture flow of a document is undrivable.
+                    # Chrome wants the full sequence with a rising count, not a
+                    # single event with clickCount 2.
+                    if kind == "dblclick":
+                        # The gap matters. Some screens implement "double click"
+                        # themselves, counting two ordinary clicks inside a
+                        # window of their own choosing — 400 ms here, 450 ms
+                        # there. Too slow and it is two single clicks; too fast
+                        # and a native handler may coalesce them.
+                        gap = float(request.get("interval", 80)) / 1000.0
+                        for count in (1, 2):
+                            for event in ("mousePressed", "mouseReleased"):
+                                call("Input.dispatchMouseEvent", type=event, x=x, y=y,
+                                     button="left", clickCount=count, modifiers=held)
+                            if count == 1:
+                                time.sleep(gap)
+                    else:
+                        call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y,
+                             button="left", clickCount=1, modifiers=held)
+                        # A long press is a gesture in its own right on touch:
+                        # context menus and multi-select hang off it, and a
+                        # press with no duration never reaches them.
+                        hold_ms = float(request.get("press", 0) or 0)
+                        if hold_ms > 0:
+                            time.sleep(hold_ms / 1000.0)
+                        call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y,
+                             button="left", clickCount=1, modifiers=held)
+                finally:
+                    for name, code in reversed(pressed):
+                        call("Input.dispatchKeyEvent", type="keyUp", key=name, code=code)
                 if kind == "fill":
                     call(
                         "Input.dispatchKeyEvent",
@@ -328,7 +788,27 @@ def browser_operation(request):
                         code="KeyA",
                         modifiers=4 if sys.platform == "darwin" else 2,
                     )
-                    call("Input.insertText", text=request["text"])
+                    # `insertText` lands the whole string in one go. That is the
+                    # right default — it is fast and it reaches contenteditable
+                    # editors that only listen for beforeinput.
+                    #
+                    # But rhythm is sometimes part of the meaning. A point of
+                    # sale watches the gap between keystrokes to tell a barcode
+                    # reader from a person typing, and a search box with a
+                    # debounce only fires once the typing stops. Neither can be
+                    # exercised by a string that appears all at once, and
+                    # neither failure looks like a timing problem: one adds a
+                    # line nobody asked for, the other returns the results of
+                    # the previous query.
+                    per_key = float(request.get("key_delay", 0) or 0)
+                    if per_key > 0:
+                        for character in request["text"]:
+                            call("Input.dispatchKeyEvent", type="keyDown", text=character,
+                                 key=character, unmodifiedText=character)
+                            call("Input.dispatchKeyEvent", type="keyUp", key=character)
+                            time.sleep(per_key / 1000.0)
+                    else:
+                        call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
     info = evaluate(READ_STATE)
