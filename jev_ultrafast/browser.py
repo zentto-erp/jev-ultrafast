@@ -356,6 +356,45 @@ def browser_operation(request):
             raise StalePage("That element is no longer in the document")
         return found
 
+    if operation == "touch":
+        # Touch or mouse is not a property of the run, it is a property of the
+        # STEP. An application that branches on pointer type renders a different
+        # tree for each: with touch on, an on-screen keypad appears and HTML5
+        # drag disappears; with it off, the reverse. Choosing once per session
+        # means half the product is untestable, so it is switchable.
+        on = bool(request.get("enabled", True))
+        call("Emulation.setTouchEmulationEnabled", enabled=on,
+             maxTouchPoints=int(request.get("points", 1)) if on else 1)
+        call("Emulation.setEmitTouchEventsForMouse", enabled=on,
+             configuration="mobile" if on else "desktop")
+        return {"touch": on}
+
+    if operation == "hover":
+        # Hovering is not standing still. A tooltip that listens for mousemove
+        # never fires if the pointer is teleported to its centre, and a control
+        # revealed at `opacity: 0` stays invisible to anything reading pixels —
+        # while being perfectly clickable, which is how a run ends up reporting
+        # that it clicked something nobody can see.
+        node = request.get("node")
+        if type(node) is not int:
+            raise ValueError("Invalid observed node")
+        spot = evaluate("""(node => {
+          const e=window.__jevFast?.nodes.get(node);
+          if (!e?.isConnected) return null;
+          const r=e.getBoundingClientRect();
+          if (!r.width || !r.height) return null;
+          return {x:r.x+r.width/2, y:r.y+r.height/2};
+        })(%s)""" % json.dumps(node))
+        if spot is None:
+            raise StalePage("That element is gone or has no box to hover")
+        # Approach from slightly off, then settle: two real moves, because one
+        # event at the destination is indistinguishable from never having moved.
+        for x, y in ((spot["x"] - 12, spot["y"] - 12), (spot["x"], spot["y"])):
+            call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+            time.sleep(0.03)
+        time.sleep(float(request.get("settle", 0.25)))
+        return {"hovered": node}
+
     if operation in ("drag", "contextmenu"):
         # Gestures a menu of actions cannot offer.
         #
@@ -597,14 +636,29 @@ def browser_operation(request):
                     # Chrome wants the full sequence with a rising count, not a
                     # single event with clickCount 2.
                     if kind == "dblclick":
+                        # The gap matters. Some screens implement "double click"
+                        # themselves, counting two ordinary clicks inside a
+                        # window of their own choosing — 400 ms here, 450 ms
+                        # there. Too slow and it is two single clicks; too fast
+                        # and a native handler may coalesce them.
+                        gap = float(request.get("interval", 80)) / 1000.0
                         for count in (1, 2):
                             for event in ("mousePressed", "mouseReleased"):
                                 call("Input.dispatchMouseEvent", type=event, x=x, y=y,
                                      button="left", clickCount=count, modifiers=held)
+                            if count == 1:
+                                time.sleep(gap)
                     else:
-                        for event in ("mousePressed", "mouseReleased"):
-                            call("Input.dispatchMouseEvent", type=event, x=x, y=y,
-                                 button="left", clickCount=1, modifiers=held)
+                        call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y,
+                             button="left", clickCount=1, modifiers=held)
+                        # A long press is a gesture in its own right on touch:
+                        # context menus and multi-select hang off it, and a
+                        # press with no duration never reaches them.
+                        hold_ms = float(request.get("press", 0) or 0)
+                        if hold_ms > 0:
+                            time.sleep(hold_ms / 1000.0)
+                        call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y,
+                             button="left", clickCount=1, modifiers=held)
                 finally:
                     for name, code in reversed(pressed):
                         call("Input.dispatchKeyEvent", type="keyUp", key=name, code=code)
@@ -624,7 +678,27 @@ def browser_operation(request):
                         code="KeyA",
                         modifiers=4 if sys.platform == "darwin" else 2,
                     )
-                    call("Input.insertText", text=request["text"])
+                    # `insertText` lands the whole string in one go. That is the
+                    # right default — it is fast and it reaches contenteditable
+                    # editors that only listen for beforeinput.
+                    #
+                    # But rhythm is sometimes part of the meaning. A point of
+                    # sale watches the gap between keystrokes to tell a barcode
+                    # reader from a person typing, and a search box with a
+                    # debounce only fires once the typing stops. Neither can be
+                    # exercised by a string that appears all at once, and
+                    # neither failure looks like a timing problem: one adds a
+                    # line nobody asked for, the other returns the results of
+                    # the previous query.
+                    per_key = float(request.get("key_delay", 0) or 0)
+                    if per_key > 0:
+                        for character in request["text"]:
+                            call("Input.dispatchKeyEvent", type="keyDown", text=character,
+                                 key=character, unmodifiedText=character)
+                            call("Input.dispatchKeyEvent", type="keyUp", key=character)
+                            time.sleep(per_key / 1000.0)
+                    else:
+                        call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
     info = evaluate(READ_STATE)

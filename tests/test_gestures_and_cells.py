@@ -245,3 +245,54 @@ def test_an_element_without_a_box_is_refused():
     source = browser_source()
     assert "if (!r.width || !r.height) return null;" in source
     assert "no box to aim at" in source
+
+
+# ─── What Playwright can do, and so can we ────────────────────────────────
+
+def test_touch_emulation_is_per_step():
+    """With touch on, a keypad appears and HTML5 drag disappears. Both must be testable."""
+    source = browser_source()
+    assert 'if operation == "touch":' in source
+    assert "Emulation.setTouchEmulationEnabled" in source
+    assert "Emulation.setEmitTouchEventsForMouse" in source
+
+
+def test_hover_actually_moves_the_pointer():
+    """A tooltip listening for mousemove never fires if the pointer teleports."""
+    source = browser_source()
+    hover = source.split('if operation == "hover":')[1].split("\n    if operation")[0]
+    assert hover.count("mouseMoved") >= 1
+    assert "spot[\"x\"] - 12" in hover, "approach from off-target, then settle"
+
+
+def test_hover_refuses_an_element_with_no_box():
+    source = browser_source()
+    hover = source.split('if operation == "hover":')[1].split("\n    if operation")[0]
+    assert "if (!r.width || !r.height) return null;" in hover
+
+
+def test_typing_can_be_paced():
+    """A point of sale reads the gap between keystrokes; a debounce waits for a pause."""
+    source = browser_source()
+    assert 'request.get("key_delay", 0)' in source
+    assert "for character in request[\"text\"]:" in source
+
+
+def test_instant_insert_stays_the_default():
+    """It is faster and it reaches editors that only listen for beforeinput."""
+    source = browser_source()
+    assert "if per_key > 0:" in source
+    assert 'call("Input.insertText", text=request["text"])' in source
+
+
+def test_double_click_interval_is_controllable():
+    """Screens that count two clicks themselves use windows of 400-450 ms."""
+    source = browser_source()
+    assert 'request.get("interval", 80)' in source
+
+
+def test_a_press_can_be_held():
+    """Long press is a gesture: context menus and multi-select hang off it."""
+    source = browser_source()
+    assert 'request.get("press", 0)' in source
+    assert "hold_ms / 1000.0" in source
