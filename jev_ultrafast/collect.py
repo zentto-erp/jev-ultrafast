@@ -62,6 +62,65 @@ def collect(browser, url, match=None, settle=8.0):
     return harvested or {"url": url, "groups": []}
 
 
+def inspect_page(browser, url, settle=8.0):
+    """Lo que la página dice DE SI MISMA: errores, llamadas caídas, controles
+    apagados.
+
+    Es la otra mitad del trabajo de un agente de QA. `harvest` responde "qué
+    dice la pantalla"; esto responde "¿está sana?". Y responde con hechos que
+    la página misma produjo, no con una opinión sobre si la aplicación va bien.
+
+    🚨 La distinción no es un matiz. Una pantalla puede verse perfecta y estar
+    montada sobre una respuesta que nunca llegó; y al revés, un defecto real se
+    le echa al conductor cuando no hay forma de separar "falló la aplicación"
+    de "falló el click". Por eso el veredicto cuenta lo observado y no dice
+    nunca que un flujo funcione: esto mira UNA pantalla, no prueba un camino.
+
+    El armado va ANTES de navegar. Después es tarde: los errores de consola y
+    los diálogos de la carga —que son la mayoría— ya habrían ocurrido sin nadie
+    escuchando.
+    """
+    browser.arm()
+    browser.navigate(url)
+    browser.wait_until_settled()
+    if settle:
+        import time
+        time.sleep(settle)
+
+    seen = browser.console(clear=False) or {}
+    calls = (browser.network(all_calls=False) or {}).get("calls", [])
+    page = browser.observe(screenshot=False)
+
+    console = [one for one in seen.get("entries", [])
+               if one.get("level") in ("error", "uncaught", "unhandled")]
+    warnings = [one for one in seen.get("entries", []) if one.get("level") == "warn"]
+    return {
+        "url": page.get("url", url),
+        "title": page.get("title"),
+        "errors": console[:20],
+        "warnings": warnings[:10],
+        "failed_calls": calls[:20],
+        # Un diálogo nativo que salta solo durante la carga es una pregunta que
+        # nadie contestó hasta ahora; saber QUE se pregunto es un hallazgo.
+        "dialogs": seen.get("dialogs", [])[:10],
+        # Un control apagado no es un defecto, pero la razon de estarlo —cuando
+        # la pagina la publica— es lo que separa "hay que rellenar algo" de
+        # "esto no deberia estar gris".
+        "blocked": page.get("blocked", [])[:12],
+        "reachable_controls": len(page.get("actions", [])),
+        "keys": page.get("keys", []),
+        "verdict": {
+            "errors": len(console),
+            "failed_calls": len(calls),
+            "dialogs": len(seen.get("dialogs", [])),
+            # Limpio quiere decir "esta pantalla no se quejo", no "la
+            # aplicacion funciona". Decir lo segundo desde aqui seria mentir.
+            "clean": not console and not calls,
+            "means": "this is one screen reporting on itself, not a flow that was tested",
+        },
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="jev-collect", description=__doc__)
     parser.add_argument("urls", nargs="+", help="las páginas a leer")
@@ -71,11 +130,17 @@ def main(argv=None):
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
                         help="el Chrome sin ventana al que hablar")
     parser.add_argument("--out", help="escribir el JSON a un fichero en vez de a la salida")
+    parser.add_argument("--inspect", action="store_true",
+                        help="en vez de los datos, lo que la pagina dice de si misma: "
+                             "errores, llamadas caidas y controles apagados")
     args = parser.parse_args(argv)
 
     browser = open_browser(args.endpoint)
     try:
-        pages = [collect(browser, url, args.match, args.settle) for url in args.urls]
+        look = inspect_page if args.inspect else None
+        pages = [look(browser, url, args.settle) if look
+                 else collect(browser, url, args.match, args.settle)
+                 for url in args.urls]
     finally:
         browser.close()
     # Una página sola devuelve la página; varias devuelven la lista. Envolver

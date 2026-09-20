@@ -36,7 +36,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .collect import DEFAULT_ENDPOINT, collect, open_browser
+from .collect import DEFAULT_ENDPOINT, collect, inspect_page, open_browser
 
 MAX_BODY = 64 * 1024
 MAX_URLS = 10
@@ -85,11 +85,13 @@ class Collector:
         self.lock = threading.Lock()
         self.browser = None
 
-    def gather(self, urls, match, settle):
+    def gather(self, urls, match, settle, look=False):
         with self.lock:
             if self.browser is None:
                 self.browser = open_browser(self.endpoint)
             try:
+                if look:
+                    return [inspect_page(self.browser, url, settle) for url in urls]
                 return [collect(self.browser, url, match, settle) for url in urls]
             except Exception:
                 # Un navegador que se cayó deja a este objeto sirviendo errores
@@ -128,7 +130,11 @@ def handler_for(collector, token):
             return self.reply(404, {"error": "not_found"})
 
         def do_POST(self):
-            if self.path != "/collect":
+            # Dos puertas al mismo navegador: `/collect` responde que DICE la
+            # pantalla, `/inspect` responde si esta sana. Un agente de QA
+            # necesita las dos, y separarlas evita que una corrida que solo
+            # queria datos cargue con un informe de errores, y al reves.
+            if self.path not in ("/collect", "/inspect"):
                 return self.reply(404, {"error": "not_found"})
             given = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
             # Comparación en tiempo constante: con `==` el tiempo de respuesta
@@ -161,7 +167,7 @@ def handler_for(collector, token):
             except (TypeError, ValueError):
                 return self.reply(400, {"error": "bad_settle"})
             try:
-                pages = collector.gather(urls, match, settle)
+                pages = collector.gather(urls, match, settle, look=self.path == "/inspect")
             except Exception as failed:
                 return self.reply(502, {"error": "collect_failed", "because": str(failed)[:300]})
             return self.reply(200, pages[0] if len(pages) == 1 else {"pages": pages})
@@ -185,7 +191,7 @@ def main(argv=None):
     server = ThreadingHTTPServer((args.host, args.port),
                                  handler_for(Collector(args.endpoint), token))
     print(json.dumps({"listening": f"http://{args.host}:{args.port}",
-                      "endpoints": ["GET /healthz", "POST /collect"]}))
+                      "endpoints": ["GET /healthz", "POST /collect", "POST /inspect"]}))
     server.serve_forever()
 
 
