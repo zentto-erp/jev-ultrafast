@@ -162,6 +162,7 @@ def runner():
     a = loop.Agent.__new__(loop.Agent)
     a.screenshots = False
     a.pending_text = None
+    a.upload_files = []
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -318,3 +319,72 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+# ─── UPLOAD: a file input the agent can actually attach a file to ────────────
+
+def test_action_space_offers_upload_for_file_inputs():
+    actions = [
+        {"id": "up1", "kind": "upload", "label": "Upload file to Profile photo",
+         "role": "button", "value": "", "node": 40},
+        {"id": "e3", "kind": "click", "label": "Go", "role": "button", "value": "", "node": 20},
+    ]
+    elements, targets, controls = model.action_space(actions)
+    assert targets["UPLOAD"]["1"]["id"] == "up1"
+    assert elements[0]["operations"] == ["UPLOAD"]
+
+
+def test_upload_is_an_offered_operation_with_its_own_head(monkeypatch):
+    p = page()
+    p["actions"].append({"id": "up1", "kind": "upload", "label": "Upload file to Photo",
+                         "role": "button", "value": "", "node": 40})
+    p["fingerprint"] = fingerprint(p)
+
+    def post(_url, _key, body):
+        q = body["questions"]
+        assert "UPLOAD" in q["operation"]["criteria"]
+        assert "upload_target" in q
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(q["operation"]["criteria"], "UPLOAD"),
+                # Only the head of the chosen operation is validated; pick the
+                # single observed upload target by its real index.
+                "upload_target": choice(q["upload_target"]["criteria"], next(iter(q["upload_target"]["criteria"]))),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(p, "Upload the profile picture", [])
+    assert d["operation"] == "UPLOAD" and d["choice"] == "up1"
+
+
+def _upload_page(runner):
+    p = runner.state["page"]
+    p["actions"].append({"id": "up1", "kind": "upload", "label": "Upload file to Profile photo",
+                         "role": "button", "value": "", "node": 40})
+    p["fingerprint"] = fingerprint(p)
+    runner.state["decision"] = {
+        "choice": "up1", "operation": "UPLOAD", "target": "1",
+        "confidence": 1.0, "probabilities": {"up1": 1.0}, "latency_ms": 10, "usage": {},
+    }
+    return p
+
+
+def test_upload_hands_the_run_file_to_the_input(runner):
+    runner.upload_files = ["/tmp/logo.png"]
+    p = _upload_page(runner)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    runner.state["browser"].upload.assert_called_once_with(40, ["/tmp/logo.png"])
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["history"][-1]["kind"] == "upload"
+
+
+def test_upload_without_a_run_file_blocks_before_touching_the_browser(runner):
+    runner.upload_files = []
+    p = _upload_page(runner)
+    with pytest.raises(ValueError, match="no file was provided"):
+        runner.command("act", {"fingerprint": p["fingerprint"]})
+    runner.state["browser"].upload.assert_not_called()
+    assert runner.state["status"] == "blocked"
