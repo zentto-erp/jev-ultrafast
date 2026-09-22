@@ -331,6 +331,30 @@
       label:'Edit cell '+own.slice(0,40)+(context ? ' — '+context : ''),
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}});
   }
+  // Upload pass: `safe` keeps file inputs out of the control passes so the model
+  // never types into one, but the agent still needs a way to attach a file. A
+  // file input is almost always hidden behind a button and opens a native OS
+  // dialog no driver can reach, so a plain click is a dead end. Offer each file
+  // input as its own `upload` action instead; the executor resolves the input
+  // (even hidden, even behind its button) and hands it the file provided to the
+  // run via DOM.setFileInputFiles. No dialog is ever opened. The action is only
+  // useful when a file was passed to the run, but naming it always is harmless
+  // and lets the model see the control exists.
+  for (const e of crossRoots('input[type=file]')) {
+    if (e.disabled) continue;
+    let label=name(e);
+    if (!label) {
+      const trigger=e.closest('label') ||
+        (e.id && document.querySelector('label[for="'+CSS.escape(e.id)+'"]')) ||
+        e.closest('button,[role="button"]');
+      label=trigger ? (name(trigger) || (trigger.innerText||'').replace(/\s+/g,' ').trim()) : '';
+    }
+    if (!label) label=e.getAttribute('aria-label') || e.getAttribute('data-testid') || 'file upload';
+    const r=e.getBoundingClientRect();
+    actions.push({node:identity(e),role:'button',kind:'upload',value:'',
+      label:'Upload file to '+label.slice(0,60),
+      rect:{x:r.x,y:r.y,w:r.width,h:r.height}});
+  }
   const words=[]; const range=document.createRange(); let node,length=0;
   const walkers=textRoots().map(r=>document.createTreeWalker(r,NodeFilter.SHOW_TEXT));
   const nextText=()=>{ while (walkers.length) { const n=walkers[0].nextNode(); if (n) return n; walkers.shift(); } return null; };

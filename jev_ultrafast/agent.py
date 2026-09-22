@@ -10,12 +10,20 @@ from .questions import MAX_MODEL_CALLS, MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False, reuse_target=None, viewport="fixed"):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, reuse_target=None,
+                 viewport="fixed", upload_files=None):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        # Files the run may attach when the model chooses UPLOAD. The model can
+        # decide *that* a file goes in a control, never *which* file — a path is
+        # not something to invent — so it is provided here and validated up front.
+        self.upload_files = [str(Path(f).resolve()) for f in (upload_files or [])]
+        missing = [f for f in self.upload_files if not Path(f).is_file()]
+        if missing:
+            raise ValueError(f"upload file not found: {missing[0]}")
         # `reuse_target` drives an existing tab instead of opening one, for when
         # a person is watching several runs in a row and the work should stay
         # where they are looking.
@@ -106,18 +114,34 @@ class Agent:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action budget (JEV_MAX_STEPS)")
             text, helper = None, None
-            if action["kind"] == "fill":
-                if not state["browser"].fresh(page):
-                    raise StalePage("Page changed before text generation. Choose again.")
-                context = field_context(state["goal"], action, page, state["history"])
-                if self.pending_text and self.pending_text[0] == context:
-                    _, text, helper = self.pending_text
-                else:
-                    text, helper = field_text(context)
-                    self.pending_text = (context, text, helper)
-                    state["text_calls"].append({**helper, "field": action["label"], "value": text})
-            # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            if action["kind"] == "upload":
+                # UPLOAD is a directed operation, not a click: the file input is
+                # usually hidden and its native OS dialog is undriveable, so the
+                # file is handed straight to the input. It needs a file provided
+                # to the run — without one there is nothing to attach.
+                if not self.upload_files:
+                    state["status"] = "blocked"
+                    raise ValueError(
+                        "UPLOAD was chosen but no file was provided to the run "
+                        "(--upload-file). Nothing uploaded."
+                    )
+                if not state["browser"].fresh(page, action):
+                    raise StalePage("Page changed before upload. Choose again.")
+                state["browser"].upload(action["node"], self.upload_files)
+                state["browser"].after_input = action
+            else:
+                if action["kind"] == "fill":
+                    if not state["browser"].fresh(page):
+                        raise StalePage("Page changed before text generation. Choose again.")
+                    context = field_context(state["goal"], action, page, state["history"])
+                    if self.pending_text and self.pending_text[0] == context:
+                        _, text, helper = self.pending_text
+                    else:
+                        text, helper = field_text(context)
+                        self.pending_text = (context, text, helper)
+                        state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                # Browser.act checks freshness immediately before input, including after text generation.
+                state["browser"].act(action, page, text=text)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
