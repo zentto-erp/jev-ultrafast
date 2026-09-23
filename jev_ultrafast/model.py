@@ -12,10 +12,11 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
-def post_json(url, key, body):
+def post_json(url, key, body, headers=None):
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body,
+                                   headers=headers or {"Authorization": f"Bearer {key}"})
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -174,16 +175,41 @@ def field_context(goal, action, page, history):
     }
 
 
-def field_text(context):
-    key = os.environ.get("TEXT_MODEL_API_KEY")
-    if not key:
-        raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
-    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-    model = os.environ.get("TEXT_MODEL", "deepseek-chat")
+def anthropic_text(base, key, model, context):
+    """El dialecto Messages de Anthropic, para el proveedor que habla ese.
+
+    Existe porque no todo el mundo puede darle a este motor una clave de un
+    proveedor: una organizacion que centraliza sus llamadas a modelos en una sola
+    puerta —para no repartir la clave real por cada servicio, y a veces para
+    salir por una region que el proveedor no bloquea— expone esa puerta con este
+    formato. Sin soportarlo, la unica forma de escribir texto es pedir una clave
+    propia, que es exactamente lo que esa puerta existe para evitar.
+
+    No pide `response_format`, porque este dialecto no lo tiene; el contrato de
+    devolver un solo JSON ya esta en las instrucciones, y la validacion de la
+    respuesta es la misma de siempre.
+    """
+    result = post_json(
+        base + "/v1/messages",
+        key,
+        {
+            "model": model,
+            "max_tokens": 1024,
+            "system": TEXT_VALUE,
+            "messages": [{"role": "user", "content": json.dumps(context)}],
+        },
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+    )
+    blocks = result.get("content") or []
+    texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+    return "".join(texts), result
+
+
+def openai_text(base, key, model, context):
+    """El dialecto de compleciones, que es el que habla casi todo lo demas."""
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
-    started = time.perf_counter()
     result = post_json(
         base + "/chat/completions",
         key,
@@ -194,22 +220,40 @@ def field_text(context):
             **reasoning,
             "messages": [
                 {"role": "system", "content": TEXT_VALUE},
-                {
-                    "role": "user",
-                    "content": json.dumps(context),
-                },
+                {"role": "user", "content": json.dumps(context)},
             ],
         },
     )
+    return result["choices"][0]["message"]["content"], result
+
+
+def field_text(context):
+    key = os.environ.get("TEXT_MODEL_API_KEY")
+    if not key:
+        raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
+    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    model = os.environ.get("TEXT_MODEL", "deepseek-chat")
+    # Explicito y no adivinado por la URL: dos puertas distintas pueden vivir en
+    # el mismo dominio, y equivocarse de dialecto da un error de campos que no
+    # dice nada sobre la causa.
+    wire = os.environ.get("TEXT_MODEL_WIRE", "openai").strip().lower()
+    if wire not in {"openai", "anthropic"}:
+        raise ValueError("TEXT_MODEL_WIRE must be openai or anthropic")
+    started = time.perf_counter()
+    speak = anthropic_text if wire == "anthropic" else openai_text
+    raw, result = speak(base, key, model, context)
     try:
-        output = json.loads(result["choices"][0]["message"]["content"])
+        output = json.loads(raw)
         value = output["text"]
         if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
             raise ValueError()
     except (ValueError, KeyError, TypeError):
         raise ValueError("Text helper returned no valid field value; nothing typed.") from None
     return value, {
-        "model": model,
+        # El modelo que CONTESTO, no el que se pidio: una puerta compartida puede
+        # servir otro —mas rapido, o el unico disponible— y apuntar el pedido
+        # dejaria el registro de la corrida diciendo algo que no paso.
+        "model": result.get("model") or model,
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "usage": result.get("usage", {}),
     }
