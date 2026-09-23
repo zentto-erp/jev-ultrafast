@@ -237,6 +237,63 @@ def modifier_mask(names):
     return mask
 
 
+def pace():
+    """A que velocidad se opera el navegador. Dos usos, exigencias opuestas.
+
+    Cuando lo que se quiere es un RESULTADO —probar una pantalla, rellenar un
+    formulario, sacar unos datos— el ritmo ideal es ninguno: cuanto antes
+    termine, mejor, y nadie va a mirar el recorrido.
+
+    Cuando lo que se quiere es un VIDEO, ese mismo recorrido no sirve. Un clic
+    que ocurre en el mismo fotograma en que el cursor aparece no se ve: quien
+    mira no sabe donde se pulso, y el tutorial no ensena nada aunque cada paso
+    funcione. Ahi hacen falta las tres cosas que hace una persona sin pensarlo —
+    llevar el cursor hasta el control, detenerse un momento encima, y escribir a
+    un ritmo que se pueda leer.
+
+    Es la misma operacion; lo que cambia es para quien se hace. Por eso es un
+    ajuste y no dos motores: un recorrido grabado tiene que ejercitar
+    exactamente el mismo camino que el que se prueba, o el video ensena algo que
+    no es lo que la aplicacion hace.
+
+    `JEV_PACE=human` (o `video`) lo activa; el valor por defecto deja todo como
+    estaba.
+    """
+    modo = (os.environ.get("JEV_PACE") or "fast").strip().lower()
+    if modo in {"human", "humano", "video"}:
+        return {
+            "modo": "human",
+            # Pasos intermedios hasta el control. Un solo evento en el destino es
+            # indistinguible de no haberse movido nunca.
+            "aproximar": 12,
+            "antes_del_clic": 0.35,
+            "despues_del_clic": 0.55,
+            "por_tecla_ms": 110,
+        }
+    return {"modo": "fast", "aproximar": 0, "antes_del_clic": 0.0,
+            "despues_del_clic": 0.0, "por_tecla_ms": 0}
+
+
+def approach(call, x, y, ritmo):
+    """Llevar el cursor hasta el punto, de forma que se vea que llego.
+
+    No es decoracion: el `mousemove` tambien dispara los `hover` de la pagina, y
+    hay menus que solo se despliegan al pasar por encima. Un clic teletransportado
+    se salta ese estado intermedio.
+    """
+    pasos = ritmo["aproximar"]
+    if pasos <= 0:
+        return
+    for n in range(1, pasos + 1):
+        # Desde arriba-izquierda del objetivo, acercandose. El arranque no
+        # importa: lo que importa es que haya recorrido.
+        avance = n / pasos
+        call("Input.dispatchMouseEvent", type="mouseMoved",
+             x=x - 90 * (1 - avance), y=y - 60 * (1 - avance))
+        time.sleep(0.016)
+    time.sleep(ritmo["antes_del_clic"])
+
+
 def snapshot_budgets():
     """Caps the observation applies, overridable per run.
 
@@ -1809,6 +1866,8 @@ def browser_operation(request):
                 # page misbehaving rather than the driver.
                 held = modifier_mask(action.get("modifiers"))
                 pressed = []
+                ritmo = pace()
+                approach(call, x, y, ritmo)
                 try:
                     for name, code, bit in MODIFIERS:
                         if held & bit:
@@ -1847,6 +1906,11 @@ def browser_operation(request):
                 finally:
                     for name, code in reversed(pressed):
                         call("Input.dispatchKeyEvent", type="keyUp", key=name, code=code)
+                # Que la pantalla reaccione ANTES de seguir. En un video es lo
+                # que deja ver el efecto del clic; en un recorrido rapido no
+                # cuesta nada porque vale cero.
+                if ritmo["despues_del_clic"]:
+                    time.sleep(ritmo["despues_del_clic"])
                 if kind == "fill":
                     call(
                         "Input.dispatchKeyEvent",
@@ -1875,7 +1939,10 @@ def browser_operation(request):
                     # neither failure looks like a timing problem: one adds a
                     # line nobody asked for, the other returns the results of
                     # the previous query.
-                    per_key = float(request.get("key_delay", 0) or 0)
+                    # Lo que pida quien llama manda; si no pide nada, el ritmo
+                    # decide. Un punto de venta lee el compas del teclado, y un
+                    # video necesita que se pueda leer lo que se escribe.
+                    per_key = float(request.get("key_delay", 0) or 0) or pace()["por_tecla_ms"]
                     if per_key > 0:
                         for character in request["text"]:
                             call("Input.dispatchKeyEvent", type="keyDown", text=character,
