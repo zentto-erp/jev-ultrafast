@@ -75,6 +75,12 @@ def counts(page, body):
         "elements_offered": len(elements),
         "select_options": sum(len(e.get("options", [])) for e in elements),
         "page_text_chars": len(page.get("text", "")),
+        # Que se observo, no solo lo observado: una medida sobre un trozo de
+        # pantalla no se puede comparar con una sobre la pantalla entera, y sin
+        # esto las dos salen igual de creibles.
+        "scope": page.get("scope"),
+        "scope_missing": page.get("scope_missing", False),
+        "ignored": page.get("ignored", []),
         "blocked_reported": len(page.get("blocked", [])),
         "targets_per_operation": targets,
     }
@@ -95,7 +101,7 @@ def measure(page, goal, history=None):
     }
 
 
-def observe_url(url, viewport, reuse_tab):
+def observe_url(url, viewport, reuse_tab, scope=None, ignore=None):
     """Abre la pantalla y devuelve la observacion cruda.
 
     Se importa aqui y no arriba porque abrir el navegador es lo unico caro de
@@ -104,7 +110,7 @@ def observe_url(url, viewport, reuse_tab):
     """
     from jev_ultrafast.browser import Browser
 
-    browser = Browser(url, reuse_target=reuse_tab, viewport=viewport)
+    browser = Browser(url, reuse_target=reuse_tab, viewport=viewport, scope=scope, ignore=ignore)
     try:
         return browser.observe(screenshot=False)
     finally:
@@ -152,6 +158,11 @@ def render(results, live_results):
                 counted["page_text_chars"], counted["blocked_reported"])
         )
         lines.append("Targets por operacion: {}".format(counted["targets_per_operation"]))
+        if counted.get("scope"):
+            aviso = " — NO ENCONTRADO, se observo la pantalla entera" if counted["scope_missing"] else ""
+            lines.append("Acotado a: {}{}".format(counted["scope"], aviso))
+        if counted.get("ignored"):
+            lines.append("Excluido: {}".format(", ".join(counted["ignored"])))
         lines.append("")
     for measured, answered in zip(results, live_results):
         if not answered:
@@ -180,6 +191,8 @@ def main(argv=None):
                         help="el goal cambia el cuerpo, asi que forma parte de la medida")
     parser.add_argument("--reuse-tab", help="targetId de una pestana abierta, para no abrir otra")
     parser.add_argument("--viewport", default="fixed")
+    parser.add_argument("--scope", help="acotar la observacion a este contenedor")
+    parser.add_argument("--ignore", help="selectores separados por coma que se excluyen")
     parser.add_argument("--save", help="directorio donde dejar cada page.json para re-medir sin navegador")
     parser.add_argument("--live", action="store_true", help="una peticion real, para anclar bytes a tokens")
     parser.add_argument("--json", action="store_true", dest="as_json")
@@ -192,7 +205,8 @@ def main(argv=None):
     for path in args.saved:
         pages.append((path, json.loads(Path(path).read_text(encoding="utf-8-sig"))))
     for url in args.url:
-        page = observe_url(url, args.viewport, args.reuse_tab)
+        page = observe_url(url, args.viewport, args.reuse_tab, scope=args.scope,
+                           ignore=[s.strip() for s in (args.ignore or "").split(",") if s.strip()] or None)
         pages.append((url, page))
         if args.save:
             where = Path(args.save)

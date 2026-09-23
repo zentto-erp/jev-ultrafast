@@ -71,7 +71,7 @@
   // document.querySelectorAll does not cross that boundary. On an app built
   // from them the agent sees an empty page: measured on a data grid, 0 rows
   // visible where the DOM had 13. It cannot click what it cannot see.
-  const crossRoots=(selector)=>{
+  const crossRootsFrom=(start,selector)=>{
     const found=[], seen=new Set();
     const walk=(root)=>{
       if (!root || seen.has(root)) return;
@@ -89,8 +89,34 @@
         if (inner) walk(inner);
       }
     };
-    walk(document);
+    walk(start);
     return found;
+  };
+  // ── Acotar la observacion ─────────────────────────────────────────────
+  //
+  // Una pantalla de ERP tiene cabecera, menu lateral, pestanas del modulo y la
+  // rejilla. Cuando el trabajo esta en la rejilla, los otros doscientos
+  // controles no son contexto: son opciones que no pueden ser correctas,
+  // compitiendo por el tope y por la atencion de quien decide. Acotar no es una
+  // optimizacion de tamano, es quitarlas de la mesa.
+  const SCOPE=typeof window.__jevScope==='string' && window.__jevScope.trim()
+    ? window.__jevScope.trim() : null;
+  const IGNORE=(Array.isArray(window.__jevIgnore) ? window.__jevIgnore : [])
+    .filter(s=>typeof s==='string' && s.trim()).map(s=>s.trim());
+  const IGNORE_SELECTOR=IGNORE.join(',');
+  let scopeNode=null;
+  if (SCOPE) { try { scopeNode=crossRootsFrom(document,SCOPE)[0] || null; } catch { scopeNode=null; } }
+  // Pedir una parte y recibir la pantalla entera EN SILENCIO es peor que no
+  // poder acotar: el recorrido decide sobre algo distinto de lo que cree, y no
+  // hay nada en la salida que lo delate. Si el contenedor no esta se observa
+  // todo, y se dice.
+  const scope_missing=!!SCOPE && !scopeNode;
+  const scopeRoot=scopeNode || document;
+  const crossRoots=(selector)=>{
+    const found=crossRootsFrom(scopeRoot,selector);
+    return IGNORE_SELECTOR ? found.filter(e=>{
+      try { return !closestDeep(e,IGNORE_SELECTOR); } catch { return true; }
+    }) : found;
   };
   // Half of an application is not built from buttons. A card, a row, a tile or
   // a chip is a div with a click handler: no role, no tabindex, nothing the
@@ -157,7 +183,9 @@
     return found.sort((a,b)=>(a.r.width*a.r.height)-(b.r.width*b.r.height)).slice(0,MAX_SCROLLERS);
   };
   const textRoots=()=>{
-    const roots=[document.body], seen=new Set();
+    // El texto tambien se acota: leer la cabecera y el menu cuando se pidio la
+    // rejilla es la misma confusion que ofrecer sus botones.
+    const roots=[scopeNode || document.body], seen=new Set();
     const walk=(root)=>{
       if (!root || seen.has(root)) return;
       seen.add(root);
@@ -170,7 +198,7 @@
         if (inner?.body) { roots.push(inner.body); walk(inner); }
       }
     };
-    walk(document);
+    walk(scopeRoot);
     return roots;
   };
   const actions=[];
@@ -480,5 +508,8 @@
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,blocked,keys,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,blocked,keys,marker,page_key,guards,omitted_actions,
+    // Que se observo, no solo lo observado. Una observacion parcial que no se
+    // declara es una observacion que miente por omision.
+    scope:SCOPE,scope_missing,ignored:IGNORE};
 })()

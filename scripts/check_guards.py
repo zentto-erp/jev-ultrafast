@@ -55,6 +55,57 @@ CROWDED = """<!doctype html><title>Crowded screen</title>
 </script>"""
 
 
+# La forma de cualquier pantalla de aplicacion: cabecera, trabajo, pie y un aviso
+# de cookies. Los tres que no son el trabajo tienen controles perfectamente
+# clicables, y ninguno puede ser la respuesta correcta.
+SCOPED = """<!doctype html><title>Scoped screen</title>
+<nav><button>Menu uno</button><button>Menu dos</button></nav>
+<main id="work"><button>Guardar</button><label>Cantidad<input></label></main>
+<footer><button>Aviso legal</button></footer>
+<div class="banner"><button>Aceptar cookies</button></div>"""
+
+
+def scoping_removes_what_cannot_be_right():
+    """Acotar no es reducir tamano: es quitar de la mesa lo que no puede acertar.
+
+    Y lo que NO puede pasar es pedir una parte y recibir la pantalla entera en
+    silencio. Ahi el recorrido decide sobre algo distinto de lo que cree y no hay
+    nada en la salida que lo delate, que es peor que no poder acotar.
+    """
+    browser = Browser("data:text/html," + quote(SCOPED))
+    passed = []
+    try:
+        whole = {a.get("label") for a in browser.observe(screenshot=False)["actions"]}
+        assert {"Menu uno", "Aviso legal", "Aceptar cookies", "Guardar"} <= whole, whole
+
+        scoped = browser.observe(screenshot=False, scope="#work")
+        labels = {a.get("label") for a in scoped["actions"]}
+        assert "Guardar" in labels, labels
+        intruders = {"Menu uno", "Menu dos", "Aviso legal", "Aceptar cookies"} & labels
+        assert not intruders, intruders
+        assert scoped["scope"] == "#work" and scoped["scope_missing"] is False
+        passed.append("scoping offers the work and drops the chrome around it")
+
+        ignored = browser.observe(screenshot=False, ignore=[".banner", "footer"])
+        labels = {a.get("label") for a in ignored["actions"]}
+        assert "Menu uno" in labels, "excluir no es acotar: el resto sigue estando"
+        assert not ({"Aviso legal", "Aceptar cookies"} & labels)
+        passed.append("ignored regions disappear while the rest stays")
+
+        missing = browser.observe(screenshot=False, scope="#nowhere")
+        assert missing["scope_missing"] is True
+        assert "Menu uno" in {a.get("label") for a in missing["actions"]}
+        passed.append("a scope that is not there observes everything AND says so")
+
+        back = browser.observe(screenshot=False)
+        assert back["scope"] is None and not back["scope_missing"]
+        assert "Menu uno" in {a.get("label") for a in back["actions"]}
+        passed.append("a scope does not stick to the next observation")
+    finally:
+        browser.close()
+    return passed
+
+
 def crowded_screen_keeps_the_suggestions():
     """El tope no se puede comer el unico paso que continua lo escrito.
 
@@ -205,6 +256,7 @@ def main():
         browser.close()
     print("\n".join(passed))
     passed += crowded_screen_keeps_the_suggestions()
+    passed += scoping_removes_what_cannot_be_right()
     print(f"PASS: {len(passed)} browser guard checks; no model calls")
 
 

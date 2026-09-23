@@ -11,7 +11,7 @@ from .questions import MAX_MODEL_CALLS, MAX_STEPS
 
 class Agent:
     def __init__(self, url, goals, *, record_dir=None, screenshots=False, reuse_target=None,
-                 viewport="fixed", upload_files=None):
+                 viewport="fixed", upload_files=None, scope=None, ignore=None):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
@@ -27,7 +27,12 @@ class Agent:
         # `reuse_target` drives an existing tab instead of opening one, for when
         # a person is watching several runs in a row and the work should stay
         # where they are looking.
-        self.browser = Browser(url, reuse_target=reuse_target, viewport=viewport)
+        # `scope` acota la observacion a un contenedor e `ignore` excluye zonas.
+        # En una pantalla de ERP la cabecera, el menu y las pestanas del modulo no
+        # son contexto cuando el trabajo esta en la rejilla: son opciones que no
+        # pueden ser correctas compitiendo por el tope y por la decision.
+        self.browser = Browser(url, reuse_target=reuse_target, viewport=viewport,
+                               scope=scope, ignore=ignore)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:

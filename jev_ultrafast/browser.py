@@ -267,10 +267,25 @@ def harvest_script():
     return (Path(__file__).parent / "harvest.js").read_text(encoding="utf-8")
 
 
-def read_state_script():
-    """The observation, with this run's budgets attached."""
+def read_state_script(scope=None, ignore=None):
+    """The observation, with this run's budgets and scope attached.
+
+    El alcance va DENTRO de la misma expresion, no en una evaluacion previa. Una
+    observacion es una sola lectura del navegador —contenido y controles a la
+    vez, preservando la identidad de los nodos— y partirla en dos abre una
+    rendija entre fijar el alcance y leer con el: en esa rendija la pagina puede
+    cambiar, y el resultado seria un estado que no existio nunca. Hay un test que
+    cuenta las evaluaciones precisamente por esto.
+
+    Ademas se escribe siempre, tambien cuando no se acota, porque un alcance que
+    se quedara pegado de la observacion anterior haria que el paso siguiente
+    decidiera sobre un trozo de pantalla que nadie pidio.
+    """
     source = Path(__file__).with_name("snapshot.js").read_text()
-    return f"(() => {{ window.__jevBudgets={json.dumps(snapshot_budgets())}; return {source}; }})()"
+    return (f"(() => {{ window.__jevBudgets={json.dumps(snapshot_budgets())};"
+            f" window.__jevScope={json.dumps(scope)};"
+            f" window.__jevIgnore={json.dumps(ignore or [])};"
+            f" return {source}; }})()")
 
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
@@ -308,7 +323,7 @@ class StalePage(ValueError):
 
 
 class Browser:
-    def __init__(self, url, *, reuse_target=None, viewport="fixed"):
+    def __init__(self, url, *, reuse_target=None, viewport="fixed", scope=None, ignore=None):
         ensure_daemon()
         # Las pestanas que ya estaban abiertas antes de empezar son del usuario,
         # y el recorrido no tiene nada que hacer en ellas.
@@ -350,6 +365,12 @@ class Browser:
         # Se recuerda porque la emulacion es por sesion: al cambiar de pestana
         # hay que volver a aplicarla, y sin guardarla no hay que aplicar.
         self._viewport = viewport
+        # El alcance por defecto del recorrido. Se guarda aqui y no se pasa en
+        # cada llamada para que TODAS las observaciones lo hereden — incluida la
+        # que hace el bucle tras actuar, que es la que decide el paso siguiente.
+        # Con el alcance en la llamada, cualquier observacion que alguien olvide
+        # acotar devuelve la pantalla entera y deshace el acotado sin avisar.
+        self.scope, self.ignore = scope, ignore
         self._apply_viewport(viewport)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
@@ -524,7 +545,9 @@ class Browser:
             # step that was actually asked for.
             return False
 
-    def observe(self, screenshot=True):
+    def observe(self, screenshot=True, scope=None, ignore=None):
+        scope = self.scope if scope is None else scope
+        ignore = self.ignore if ignore is None else ignore
         # El reloj empieza aqui porque una observacion son dos cosas distintas
         # con causas distintas: esperar a que la pagina se quede quieta, y
         # capturarla. Sumadas dan un numero que no dice donde mirar — y en una
@@ -577,7 +600,8 @@ class Browser:
         for attempt in range(10):
             try:
                 page = browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
+                    {"operation": "observe", "session": self.session, "screenshot": screenshot,
+                     "scope": scope, "ignore": ignore}
                 )
                 # Los reintentos cuentan dentro de la captura a proposito: son
                 # tiempo que el paso pago de verdad.
@@ -1839,7 +1863,10 @@ def browser_operation(request):
                         call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
-    info = evaluate(READ_STATE)
+    scope, ignore = request.get("scope"), request.get("ignore")
+    # La constante cuando no se acota, para no recomponer el script en el caso
+    # normal; una expresion propia cuando si, con el alcance dentro.
+    info = evaluate(read_state_script(scope, ignore) if (scope or ignore) else READ_STATE)
     if info is None:
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)

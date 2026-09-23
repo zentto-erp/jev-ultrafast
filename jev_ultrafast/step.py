@@ -96,11 +96,15 @@ def main(argv=None):
     parser.add_argument("--modifiers", help="comma-separated: alt, ctrl, meta, shift")
     parser.add_argument("--press", type=float, default=0, help="ms to hold a click down")
     parser.add_argument("--enabled", default="true", choices=["true", "false"])
+    parser.add_argument("--scope", help="selector del contenedor al que acotar la observacion")
+    parser.add_argument("--ignore", help="selectores separados por coma que se excluyen")
     parser.add_argument("--viewport", default="none",
                         help="'none' keeps the window the owner set — the default here on purpose")
     args = parser.parse_args(argv)
 
-    browser = Browser(None, reuse_target=args.reuse_tab, viewport=args.viewport)
+    browser = Browser(None, reuse_target=args.reuse_tab, viewport=args.viewport,
+                      scope=args.scope,
+                      ignore=[s.strip() for s in (args.ignore or "").split(",") if s.strip()] or None)
     try:
         if args.operation == "touch":
             return browser.touch(enabled=args.enabled == "true")
