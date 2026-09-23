@@ -520,9 +520,21 @@ class Browser:
             # la ventana del alto util.
             try:
                 bounds = cdp("Browser.getWindowForTarget", targetId=self.target)["bounds"]
-                chrome = self.evaluate("(() => (outerHeight || 0) - (innerHeight || 0))()")
+                # El cromo del navegador —barras y pestañas— medido, pero con un
+                # rango de cordura. En una pestaña de FONDO `outerHeight` vale 0,
+                # asi que la resta sale negativa y el alto acaba siendo mayor que
+                # la ventana: medido, 1993 de alto en una pantalla de 1080. Una
+                # pagina emulada al doble de su altura no falla de forma visible
+                # — simplemente se observa una pantalla que no existe, con todo
+                # "dentro del viewport" y nada donde el usuario lo ve.
+                medido = self.evaluate("(() => (outerHeight || 0) - (innerHeight || 0))()")
+                try:
+                    medido = int(medido)
+                except (TypeError, ValueError):
+                    medido = 0
+                chrome = medido if 40 <= medido <= 220 else 90
                 width = int(bounds["width"]) - 16
-                height = int(bounds["height"]) - int(chrome or 90)
+                height = int(bounds["height"]) - chrome
             except Exception:
                 width = height = 0
             if width > 200 and height > 200:

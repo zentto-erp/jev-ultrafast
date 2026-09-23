@@ -293,6 +293,48 @@
     }
     const base={node:identity(e),role:rname,label,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    // ── Lo que la pagina DECLARA sobre este campo ─────────────────────────
+    //
+    // Un agente que no lee esto tiene que descubrir las obligaciones fallando:
+    // rellena lo que ve, guarda, le rechazan, vuelve. Y a veces ni eso — el
+    // rechazo llega como un aviso que no sabe relacionar con un campo, y se
+    // queda reintentando OTRA cosa. Visto en una compra del ERP: sesenta pasos
+    // repitiendo el selector de proveedor porque lo que faltaba era un numero de
+    // control que nadie le habia dicho que era obligatorio.
+    //
+    // La alternativa es escribir un caso a mano por pantalla, y eso no escala a
+    // "operar cualquier web": en cuanto sales de las pantallas preparadas, el
+    // agente vuelve a estar ciego.
+    //
+    // Nada de esto se inventa. Son las mismas senales que usa un lector de
+    // pantalla y que el navegador ya valida por su cuenta: el atributo del HTML,
+    // el ARIA que el autor puso, y el mensaje que el propio navegador daria.
+    const declarado = {};
+    if (e.required || e.getAttribute('aria-required') === 'true') declarado.obligatorio = true;
+    if (e.getAttribute('aria-invalid') === 'true') declarado.invalido = true;
+    // `validity` es la validacion del navegador, que ya sabe si un email no es un
+    // email o si falta un campo requerido — sin que nadie escriba una regla.
+    try {
+      if (e.validity && !e.validity.valid) {
+        declarado.invalido = true;
+        if (e.validationMessage) declarado.porque = e.validationMessage.slice(0, 120);
+      }
+    } catch {}
+    const dicho = textOf(e.getAttribute('aria-errormessage')) || textOf(e.getAttribute('aria-describedby'));
+    // El mensaje del autor manda sobre el del navegador: es el que explica la
+    // regla de negocio, no solo que el formato no cuadra.
+    if (dicho) declarado.porque = dicho.slice(0, 160);
+    for (const [attr, clave] of [['pattern','patron'], ['maxlength','maximo'],
+                                 ['minlength','minimo'], ['min','desde'], ['max','hasta'],
+                                 ['inputmode','teclado'], ['placeholder','ejemplo']]) {
+      const v = e.getAttribute(attr);
+      if (v) declarado[clave] = String(v).slice(0, 80);
+    }
+    // `title` en un campo con patron es, por convencion, la explicacion del
+    // formato que se espera. Sin patron suele ser una ayuda cualquiera.
+    if (e.getAttribute('pattern') && e.title) declarado.formato = e.title.slice(0, 120);
+    if (e.type && !['text','button','submit'].includes(e.type)) declarado.tipo = e.type;
+    if (Object.keys(declarado).length) base.declarado = declarado;
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;

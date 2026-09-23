@@ -298,10 +298,30 @@ class Agent:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])
                 )
+            # Dos formas de no avanzar, y hasta ahora solo se detectaba una.
+            #
+            # La primera: la pagina no cambia. Tres pasos seguidos sin efecto.
+            #
+            # La segunda: la pagina SI cambia y aun asi no se avanza, porque lo
+            # que se esta haciendo es abrir y cerrar lo mismo. Un desplegable que
+            # se despliega cuenta como cambio de pagina, asi que el detector de
+            # arriba no lo ve nunca. Medido en el ERP: SESENTA pulsaciones
+            # seguidas sobre el mismo combobox, agotando el presupuesto del
+            # recorrido, mientras el control que abria el selector de verdad
+            # estaba justo al lado sin tocar.
+            #
+            # Se mira el mismo control elegido cinco veces seguidas y no tres:
+            # hay pasos legitimos que repiten control —escribir, borrar y volver
+            # a escribir en un campo— y cortar a la tercera los rompe.
             repeated = state["history"][-3:]
+            atascado = state["history"][-5:]
             state["status"] = (
                 "blocked"
-                if len(repeated) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
+                if (len(repeated) == 3
+                    and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated))
+                or (len(atascado) == 5
+                    and len({h["choice"] for h in atascado}) == 1
+                    and atascado[-1]["kind"] != "wait")
                 else "ready"
             )
         else:
