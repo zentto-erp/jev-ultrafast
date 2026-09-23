@@ -81,6 +81,12 @@ def render(result):
     lines.append("")
     lines.append("Peticiones al modelo: {} de decision, {} de texto, para {} pasos.".format(
         resumen["model_calls"], resumen["text_calls"], resumen["steps"]))
+    cache = result.get("cache")
+    if cache:
+        lines.append("")
+        lines.append("Cache ({}): {} repetidas, {} nuevas, {} recuperadas, {} guardadas en {}".format(
+            cache["mode"], cache["hits"], cache["misses"], cache["healed"],
+            cache["entries"], cache["file"]))
     return "\n".join(lines)
 
 
@@ -93,18 +99,31 @@ def main(argv=None):
     parser.add_argument("--reuse-tab")
     parser.add_argument("--viewport", default="fixed")
     parser.add_argument("--upload-file", action="append", default=[])
+    parser.add_argument("--scope", help="acotar la observacion a este contenedor")
+    parser.add_argument("--ignore", help="selectores separados por coma que se excluyen")
+    parser.add_argument("--cache-dir", help="donde guardar y leer las decisiones de este recorrido")
+    parser.add_argument("--heal", action="store_true",
+                        help="si lo guardado deja de encajar, volver a preguntar y reescribirlo. "
+                             "Sin esto el recorrido PARA, que es lo que se quiere en pruebas")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
 
+    stopped = None
     agent = Agent(args.url, args.goal, reuse_target=args.reuse_tab, viewport=args.viewport,
-                  upload_files=args.upload_file or None)
+                  upload_files=args.upload_file or None, scope=args.scope,
+                  ignore=[s.strip() for s in (args.ignore or "").split(",") if s.strip()] or None,
+                  cache_dir=args.cache_dir, heal=args.heal)
     try:
         for _snapshot in agent.run():
             pass
     except Exception as parada:
         # Una corrida que se detiene sigue teniendo una medida valida de lo que
         # alcanzo a hacer. Tirarla y no decir nada seria perder el dato justo en
-        # el caso interesante.
+        # el caso interesante. Pero sale por codigo de error: imprimir el motivo y
+        # terminar en cero convierte un recorrido que no se completo en un exito a
+        # ojos de quien lo llamo, que es justo el fallo que el modo estricto de la
+        # cache existe para no cometer.
+        stopped = parada
         print("La corrida se detuvo: {}".format(parada), file=sys.stderr)
     finally:
         state = agent.state
@@ -114,13 +133,15 @@ def main(argv=None):
             "history": state["history"],
             "summary": summarise(state["history"], state["elapsed_ms"], state["status"]),
         }
+        if agent.decisions is not None:
+            result["cache"] = agent.decisions.report()
         agent.close()
 
     if args.as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(render(result))
-    return 0
+    return 1 if stopped is not None else 0
 
 
 if __name__ == "__main__":

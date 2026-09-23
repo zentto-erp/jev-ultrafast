@@ -5,13 +5,21 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
+from .decisions import Decisions, Diverged, resolve
 from .model import action_space, choose, field_context, field_text
 from .questions import MAX_MODEL_CALLS, MAX_STEPS
 
 
 class Agent:
+    # Sin cache por defecto, y declarado en la clase y no solo en el constructor:
+    # hay pruebas que montan un agente sin pasar por `__init__` para ejercitar un
+    # solo comando, y un atributo que solo existe si se construyo entero
+    # convierte una capacidad opcional en un requisito escondido.
+    decisions = None
+
     def __init__(self, url, goals, *, record_dir=None, screenshots=False, reuse_target=None,
-                 viewport="fixed", upload_files=None, scope=None, ignore=None):
+                 viewport="fixed", upload_files=None, scope=None, ignore=None,
+                 cache_dir=None, heal=False):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
@@ -33,6 +41,9 @@ class Agent:
         # pueden ser correctas compitiendo por el tope y por la decision.
         self.browser = Browser(url, reuse_target=reuse_target, viewport=viewport,
                                scope=scope, ignore=ignore)
+        # Las decisiones guardadas de recorridos anteriores. Sin directorio no hay
+        # cache: repetir sin haber guardado nada no es mas rapido, es adivinar.
+        self.decisions = Decisions(cache_dir, heal=heal) if cache_dir else None
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -58,6 +69,70 @@ class Agent:
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
+
+    def recall_or_choose(self, page, goal, history):
+        """Lo decidido antes para esta pantalla, o una decision nueva.
+
+        Sin cache, esto es exactamente lo que habia: una peticion por paso. Con
+        cache, la pregunta solo se hace la primera vez que el recorrido pasa por
+        aqui, y las siguientes se resuelven contra la observacion fresca leyendo
+        la etiqueta, como lo haria una persona.
+        """
+        if self.decisions is None:
+            return choose(page, goal, history)
+
+        # El paso dentro del recorrido, que es lo que identifica la decision. Un
+        # recorrido es una secuencia, no un mapa de pantallas.
+        step = len(history)
+        remembered = self.decisions.look_up(goal, step)
+        if remembered:
+            found = resolve(page, remembered)
+            if found is not None:
+                self.decisions.hits += 1
+                return self.replayed(remembered, found)
+            # Lo guardado ya no encaja. Aqui se separan los dos usos, y es el unico
+            # sitio del motor donde la misma situacion tiene dos respuestas
+            # legitimas segun para que se este usando.
+            if not self.decisions.heal:
+                raise Diverged(remembered, page)
+            self.decisions.healed += 1
+            self.decisions.forget(goal, step)
+        else:
+            self.decisions.misses += 1
+
+        decision = choose(page, goal, history)
+        # Se guarda con la accion ya resuelta, no con el id: un id no sobrevive al
+        # siguiente render y lo que se quiere recordar es QUE se pulso.
+        chosen = next((a for a in page["actions"] if a["id"] == decision["choice"]), None)
+        self.decisions.remember(goal, step, decision, chosen, url=page.get("url"))
+        return decision
+
+    def replayed(self, remembered, found):
+        """Una decision repetida, con la forma de una decidida — y sin fingir que se juzgo.
+
+        `probability` y `confidence` se quedan en `None` a proposito. Poner 1.0
+        seria comodo para quien lee el informe y falso: no hubo juicio, hubo una
+        entrada de cache. Un numero inventado ahi convierte el registro de la
+        corrida en algo que no se puede auditar.
+        """
+        choice = found if isinstance(found, str) else found["id"]
+        return {
+            "choice": choice,
+            "operation": remembered["operation"],
+            "target": None,
+            "confidence": None,
+            "probabilities": {choice: None},
+            "operation_probabilities": {},
+            "target_probabilities": {},
+            "target_confidence": None,
+            "raw_answers": {},
+            "model": "recordado",
+            "usage": {},
+            "latency_ms": 0,
+            "from_cache": True,
+            "remembered_text": remembered.get("text"),
+            "request": None,
+        }
 
     def snapshot(self):
         return {
@@ -88,9 +163,14 @@ class Agent:
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
-            if len(state["decisions"]) >= MAX_MODEL_CALLS:
+            # El presupuesto cuenta PETICIONES, no pasos: una decision recordada no
+            # llamo a nadie, y gastar su cupo haria que un recorrido cacheado se
+            # agotara igual que uno nuevo — que es precisamente lo que la cache
+            # existe para evitar.
+            asked = sum(1 for d in state["decisions"] if not d.get("from_cache"))
+            if asked >= MAX_MODEL_CALLS:
                 raise ValueError(f"Reached the {MAX_MODEL_CALLS}-call model budget (JEV_MAX_MODEL_CALLS)")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            state["decision"] = self.recall_or_choose(state["page"], state["goal"], state["history"])
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -148,18 +228,31 @@ class Agent:
                 if action["kind"] == "fill":
                     if not state["browser"].fresh(page):
                         raise StalePage("Page changed before text generation. Choose again.")
-                    context = field_context(state["goal"], action, page, state["history"])
-                    if self.pending_text and self.pending_text[0] == context:
-                        _, text, helper = self.pending_text
+                    if decision.get("remembered_text") is not None:
+                        # El valor tambien estaba decidido. Volver a generarlo es
+                        # la segunda peticion del paso, y puede salir distinta —
+                        # con lo que la repeticion dejaria de ser una repeticion.
+                        text = decision["remembered_text"]
                     else:
-                        text, helper = field_text(context)
-                        self.pending_text = (context, text, helper)
-                        state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                        context = field_context(state["goal"], action, page, state["history"])
+                        if self.pending_text and self.pending_text[0] == context:
+                            _, text, helper = self.pending_text
+                        else:
+                            text, helper = field_text(context)
+                            self.pending_text = (context, text, helper)
+                            state["text_calls"].append(
+                                {**helper, "field": action["label"], "value": text})
                 # Browser.act checks freshness immediately before input, including after text generation.
                 acted_at = time.perf_counter()
                 state["browser"].act(action, page, text=text)
                 act_ms = round((time.perf_counter() - acted_at) * 1000)
             self.pending_text = None
+            if self.decisions is not None and not decision.get("from_cache"):
+                # Ahora si se sabe el valor que se escribio, asi que la entrada se
+                # completa con el. Sin esto la repeticion ahorra la decision pero
+                # sigue pagando la generacion del texto en cada corrida.
+                self.decisions.remember(state["goal"], len(state["history"]), decision, action,
+                                        text=text, url=page.get("url"))
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
