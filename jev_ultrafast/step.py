@@ -79,7 +79,7 @@ def main(argv=None):
         "observe", "keys", "find", "click", "dblclick", "fill", "inspect", "listen", "heard",
         "component", "hold", "hover", "drag", "contextmenu", "touch", "scroll", "key",
         "arm", "console", "network", "state", "sealed", "declared", "harvest", "replay",
-        "upload", "navigate", "highlight",
+        "upload", "navigate", "highlight", "tabs", "switch", "newtab", "closetab", "pdf",
     ])
     parser.add_argument("--reuse-tab", required=True, help="targetId of the open tab")
     parser.add_argument("--match", help="text of the control, as the observation labelled it")
@@ -139,6 +139,25 @@ def main(argv=None):
         if args.operation == "navigate":
             # `--text` carries the destination: reload, back, forward, or a URL.
             return browser.navigate(args.text or "reload")
+        if args.operation == "tabs":
+            # Que hay abierto. La que se conduce viene marcada, porque "hay tres
+            # pestanas" sin saber en cual estas no dice nada.
+            return {"tabs": browser.tabs()}
+        if args.operation == "switch":
+            # `--text` lleva el targetId, tal como lo publica `tabs`.
+            if not args.text:
+                raise SystemExit("switch needs --text <targetId>, tal como lo lista `tabs`")
+            return browser.switch(args.text)
+        if args.operation == "newtab":
+            # Sin adoptarla: este proceso termina al acabar el comando y se
+            # llevaria por delante la pestana que acaba de abrir.
+            return browser.open_tab(args.text or None, own=False)
+        if args.operation == "closetab":
+            return browser.close_tab(args.text or None)
+        if args.operation == "pdf":
+            if not args.text:
+                raise SystemExit("pdf needs --text <fichero.pdf>")
+            return browser.pdf(args.text)
         if args.operation == "hold":
             return browser.hold([m.strip() for m in (args.modifiers or "").split(",") if m.strip()])
         if args.operation == "key":

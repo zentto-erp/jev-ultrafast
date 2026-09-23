@@ -1,5 +1,6 @@
 """Observed actions through Browser Harness; one CDP session, no per-step subprocess."""
 
+import base64
 import hashlib
 import json
 import os
@@ -9,7 +10,6 @@ from pathlib import Path
 
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
-
 
 # CDP modifier bits: Alt 1, Ctrl 2, Meta 4, Shift 8.
 MODIFIERS = (("Alt", "AltLeft", 1), ("Control", "ControlLeft", 2),
@@ -277,6 +277,32 @@ def read_state_script():
 READ_STATE = read_state_script()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
+def page_targets():
+    """Las pestanas de aplicacion abiertas ahora mismo, en el orden que da Chrome.
+
+    Se dejan fuera las pantallas del propio navegador. Existen y son targets,
+    pero no son pantallas de la aplicacion: ofrecerlas a un agente solo le da
+    opciones que nunca son la correcta.
+    """
+    # Una respuesta sin `targetInfos` es "no lo se", NO "no hay ninguna". Devolver
+    # una lista vacia ahi seria convertir el desconocimiento en un dato: quien
+    # pregunte concluira que el navegador esta limpio, y entonces cualquier
+    # pestana que ya estuviera abierta pasara por recien aparecida. Se levanta y
+    # que decida cada sitio como degradar, porque no degradan igual — el
+    # constructor se queda sin foto inicial, la observacion no ofrece pestanas.
+    answer = cdp("Target.getTargets")
+    if "targetInfos" not in answer:
+        raise LookupError("Target.getTargets no devolvio targetInfos")
+    pages = []
+    for info in answer["targetInfos"]:
+        if info.get("type") != "page":
+            continue
+        if info.get("url", "").startswith(("devtools://", "chrome://", "chrome-extension://")):
+            continue
+        pages.append(info)
+    return pages
+
+
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
@@ -284,6 +310,29 @@ class StalePage(ValueError):
 class Browser:
     def __init__(self, url, *, reuse_target=None, viewport="fixed"):
         ensure_daemon()
+        # Las pestanas que ya estaban abiertas antes de empezar son del usuario,
+        # y el recorrido no tiene nada que hacer en ellas.
+        #
+        # Medido al probar esto contra el Chrome del perfil de pruebas: habia
+        # QUINCE pestanas de sesiones anteriores —X, Facebook, LinkedIn, Meta
+        # Business Suite— y la observacion las ofrecia todas. Eso no es una
+        # capacidad nueva, es quince opciones de ruido en el espacio de
+        # decision, cada una de ellas incorrecta, compitiendo con los controles
+        # de la pantalla que si importan. Empeoraba la decision.
+        #
+        # Lo que el agente necesita saber no es que pestanas existen: es cual
+        # acaba de aparecer, porque eso es lo que hizo el click anterior.
+        try:
+            self.tabs_before = {info["targetId"] for info in page_targets()}
+        except Exception:
+            # `None` y no un conjunto vacio: son dos cosas distintas y la
+            # diferencia importa. Un conjunto vacio significa "no habia ninguna
+            # pestana antes", y entonces TODAS aparecieron durante el recorrido
+            # —incluidas las quince del usuario—, que es justo el ruido que este
+            # filtro existe para quitar. `None` significa "no lo se", y ante eso
+            # solo se ofrecen las que abrimos nosotros, que es la unica cosa que
+            # sabemos sin preguntarle al navegador.
+            self.tabs_before = None
         # A fresh background tab per run is right for benchmarks: runs stay
         # isolated and the user's Chrome never steals focus. It is wrong when a
         # person is watching a sequence of runs, because every run opens another
@@ -292,8 +341,15 @@ class Browser:
         self.target = reuse_target or cdp(
             "Target.createTarget", url="about:blank", background=True
         )["targetId"]
-        self.owns_target = reuse_target is None
+        # Que pestanas son nuestras, no si LA pestana es nuestra. En cuanto un
+        # recorrido puede abrir otra y cambiarse a ella, una sola bandera ya no
+        # sabe responder: al cerrar habria que cerrar la que abrimos y dejar en
+        # pie la prestada, y con un booleano se pierde una de las dos.
+        self.owned = set() if reuse_target else {self.target}
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        # Se recuerda porque la emulacion es por sesion: al cambiar de pestana
+        # hay que volver a aplicarla, y sin guardarla no hay que aplicar.
+        self._viewport = viewport
         self._apply_viewport(viewport)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
@@ -469,6 +525,12 @@ class Browser:
             return False
 
     def observe(self, screenshot=True):
+        # El reloj empieza aqui porque una observacion son dos cosas distintas
+        # con causas distintas: esperar a que la pagina se quede quieta, y
+        # capturarla. Sumadas dan un numero que no dice donde mirar — y en una
+        # aplicacion de micro-frontends la espera puede ser diez veces la
+        # captura sin que nada este roto.
+        started = time.perf_counter()
         self.rearm_if_needed()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
@@ -511,16 +573,61 @@ class Browser:
                 self.wait_until_settled(timeout=5, quiet_for=0.25)
             except Exception:
                 pass
+        settled = time.perf_counter()
         for attempt in range(10):
             try:
-                return browser_operation(
+                page = browser_operation(
                     {"operation": "observe", "session": self.session, "screenshot": screenshot}
                 )
+                # Los reintentos cuentan dentro de la captura a proposito: son
+                # tiempo que el paso pago de verdad.
+                page["timing"] = {
+                    "settle_ms": round((settled - started) * 1000),
+                    "capture_ms": round((time.perf_counter() - settled) * 1000),
+                }
+                self.offer_other_tabs(page)
+                return page
             except StalePage:
                 if attempt == 9:
                     raise
                 time.sleep(0.02)
         raise StalePage("Page did not settle")
+
+    def offer_other_tabs(self, page):
+        """Poner las demas pestanas en la observacion, como operaciones.
+
+        Van despues del tope de acciones a proposito: una pestana no compite por
+        sitio con los controles de la pantalla, y descartarla por un tope
+        pensado para una tabla densa dejaria al agente sin ver donde ocurrio el
+        trabajo.
+
+        No entran en la huella. Que aparezca una pestana no cambia la pagina
+        sobre la que se acaba de decidir, y tratarlo como cambio obligaria a
+        repetir una decision que sigue siendo valida — con el efecto colateral
+        de que una aplicacion que abre una ventana emergente al cargar dejaria
+        el recorrido en bucle.
+        """
+        try:
+            others = [tab for tab in self.tabs()
+                      if not tab["driving"] and (tab["ours"] or tab["appeared"])]
+        except Exception:
+            # Saber que otras pestanas hay es una ayuda, no un requisito. Si el
+            # navegador no contesta, la observacion sigue siendo buena.
+            return page
+        page["tabs"] = others
+        for position, tab in enumerate(others, start=1):
+            name = (tab["title"] or tab["url"] or "sin titulo").strip()
+            # Se dice que se abrio durante el recorrido porque eso es la razon
+            # para mirarla: casi siempre la abrio el paso anterior.
+            page["actions"].append({
+                "id": f"TAB_{position}",
+                "kind": "tab",
+                "node": None,
+                "target": tab["target"],
+                "label": f"Ir a la pestana abierta durante el recorrido: {name[:80]}",
+                "url": tab["url"],
+            })
+        return page
 
     def fresh(self, page, action=None):
         if action is not None and action["kind"] in {"click", "select"}:
@@ -796,11 +903,119 @@ class Browser:
         return browser_operation({"operation": "touch", "session": self.session,
                                   "enabled": enabled, "points": points})
 
+    # ─── Pestanas ─────────────────────────────────────────────────────────
+    #
+    # Un sistema web no cabe en una pestana. El ERP abre el PDF de la factura,
+    # la vista de impresion o un selector en otra, y hasta ahora el agente se
+    # quedaba mirando la que ya conocia y concluia que el boton no habia hecho
+    # nada. No era un fallo de la aplicacion: la mitad del trabajo ocurria donde
+    # nadie miraba.
+    #
+    # Se ofrecen al modelo como operaciones, igual que las teclas de funcion, y
+    # por el mismo motivo: una pestana no es un elemento del DOM, asi que no
+    # puede ser el objetivo de un click. Que aparezca una nueva es informacion
+    # que cambia el siguiente paso, y por tanto tiene que estar en la
+    # observacion y no en la cabeza de quien la lanzo.
+
+    @property
+    def owns_target(self):
+        """Si la pestana que se conduce ahora es de las que abrimos."""
+        return self.target in self.owned
+
+    def tabs(self):
+        """Las pestanas abiertas, con la que se conduce marcada.
+
+        Se excluyen las de herramientas del navegador: existen, pero no son
+        pantallas de la aplicacion y ofrecerlas solo da al modelo una opcion que
+        nunca es la correcta.
+        """
+        return [{
+            "target": info["targetId"],
+            "url": info.get("url", ""),
+            "title": info.get("title", ""),
+            "driving": info["targetId"] == self.target,
+            "ours": info["targetId"] in self.owned,
+            # Aparecio despues de empezar, asi que este recorrido pudo causarla.
+            # Sin foto inicial no se afirma: no saberlo no es que si.
+            "appeared": (self.tabs_before is not None
+                         and info["targetId"] not in self.tabs_before),
+        } for info in page_targets()]
+
+    def switch(self, target_id):
+        """Conducir otra pestana, sin cerrar la que se deja.
+
+        La que se abandona puede ser la del usuario y el paso siguiente puede
+        querer volver, asi que cambiar de pestana no destruye nada. Tampoco se
+        trae al frente: activarla robaria el foco de lo que la persona esta
+        mirando, y el motor ya sabe pintar una pestana de fondo.
+        """
+        if target_id not in {tab["target"] for tab in self.tabs()}:
+            raise ValueError(f"no hay ninguna pestana con id {target_id}")
+        self.target = target_id
+        self.session = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+        # La emulacion se aplica por sesion: al cambiar hay que repetirla o la
+        # pestana nueva se observa con la ventana en otro tamano, que es
+        # exactamente el fallo que `viewport` existe para evitar.
+        self._apply_viewport(self._viewport)
+        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.ensure_composited()
+        self.wait_until_settled()
+        # Un dialogo armado lo estaba para la sesion anterior. Se rearma en la
+        # siguiente observacion, que es donde ya se comprueba.
+        self.after_input = None
+        return {"driving": target_id, "tabs": self.tabs()}
+
+    def open_tab(self, url=None, switch=True, own=True):
+        """Abrir una pestana nueva, de fondo, y conducirla salvo que se diga que no.
+
+        `own=False` la abre sin adoptarla, para quien no puede ser su dueno: la
+        CLI es un proceso por paso, asi que una pestana suya moriria en el
+        `finally` del mismo comando que la abrio — y abrir una pestana que se
+        cierra sola no es abrir una pestana.
+        """
+        target_id = cdp("Target.createTarget", url=url or "about:blank", background=True)["targetId"]
+        if own:
+            self.owned.add(target_id)
+        if switch:
+            return self.switch(target_id)
+        return {"opened": target_id, "tabs": self.tabs()}
+
+    def close_tab(self, target_id=None):
+        """Cerrar una pestana; si es la que se conduce, pasar a otra que quede.
+
+        Quedarse conduciendo una pestana cerrada es un estado en el que todo
+        falla con un error que habla de sesiones y no de lo que paso, asi que se
+        resuelve aqui en vez de dejarlo para el primer paso siguiente.
+        """
+        target_id = target_id or self.target
+        cdp("Target.closeTarget", targetId=target_id)
+        self.owned.discard(target_id)
+        if target_id != self.target:
+            return {"closed": target_id, "tabs": self.tabs()}
+        self.target = None
+        remaining = [tab for tab in self.tabs() if tab["target"] != target_id]
+        if not remaining:
+            return {"closed": target_id, "driving": None, "tabs": []}
+        return {"closed": target_id, **self.switch(remaining[-1]["target"])}
+
+    def pdf(self, where):
+        """La pantalla tal como se imprimiria, que es la evidencia que se archiva."""
+        result = self.call("Page.printToPDF", printBackground=True)
+        Path(where).write_bytes(base64.b64decode(result["data"]))
+        return {"saved": str(Path(where).resolve()), "bytes": Path(where).stat().st_size}
+
     def close(self):
         # A borrowed tab is not ours to close: the caller is reusing it across
-        # runs, and closing it would defeat the reason for lending it.
-        if self.target and self.owns_target:
-            cdp("Target.closeTarget", targetId=self.target)
+        # runs, and closing it would defeat the reason for lending it. Lo que se
+        # cierra son las que abrimos nosotros, este conduciendo cual sea.
+        for target in list(self.owned):
+            try:
+                cdp("Target.closeTarget", targetId=target)
+            except Exception:
+                # Una pestana ya cerrada —por la propia pagina, o por el
+                # usuario— no es un fallo del cierre.
+                pass
+        self.owned.clear()
         self.target = None
 
 

@@ -78,7 +78,14 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history):
+def request_body(state, goal, history):
+    """El cuerpo exacto que se envia, y el mapa con el que se lee la respuesta.
+
+    Separado de `choose` para poder medir lo que se manda sin mandarlo. Un banco
+    que reconstruyera el cuerpo por su cuenta estaria midiendo una copia, y una
+    copia se separa del original en el primer cambio que nadie replique — con el
+    agravante de que la medida seguiria saliendo, plausible y falsa.
+    """
     elements, targets, controls = action_space(state["actions"])
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
@@ -120,6 +127,11 @@ def choose(state, goal, history):
         },
         "questions": questions,
     }
+    return body, operations, targets, controls
+
+
+def choose(state, goal, history):
+    body, operations, targets, controls = request_body(state, goal, history)
     started = time.perf_counter()
     result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)

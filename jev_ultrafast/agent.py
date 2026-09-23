@@ -114,7 +114,15 @@ class Agent:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action budget (JEV_MAX_STEPS)")
             text, helper = None, None
-            if action["kind"] == "upload":
+            if action["kind"] == "tab":
+                # Cambiar de pestana no es una entrada sobre el DOM: no hay nodo
+                # que pulsar ni valor que escribir, y la pagina de destino es
+                # otra. Por eso no pasa por `Browser.act`, que comprueba que el
+                # nodo decidido siga siendo el mismo — aqui no hay nodo.
+                acted_at = time.perf_counter()
+                state["browser"].switch(action["target"])
+                act_ms = round((time.perf_counter() - acted_at) * 1000)
+            elif action["kind"] == "upload":
                 # UPLOAD is a directed operation, not a click: the file input is
                 # usually hidden and its native OS dialog is undriveable, so the
                 # file is handed straight to the input. It needs a file provided
@@ -127,7 +135,9 @@ class Agent:
                     )
                 if not state["browser"].fresh(page, action):
                     raise StalePage("Page changed before upload. Choose again.")
+                acted_at = time.perf_counter()
                 state["browser"].upload(action["node"], self.upload_files)
+                act_ms = round((time.perf_counter() - acted_at) * 1000)
                 state["browser"].after_input = action
             else:
                 if action["kind"] == "fill":
@@ -141,7 +151,9 @@ class Agent:
                         self.pending_text = (context, text, helper)
                         state["text_calls"].append({**helper, "field": action["label"], "value": text})
                 # Browser.act checks freshness immediately before input, including after text generation.
+                acted_at = time.perf_counter()
                 state["browser"].act(action, page, text=text)
+                act_ms = round((time.perf_counter() - acted_at) * 1000)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
@@ -157,6 +169,14 @@ class Agent:
                     "text": text,
                     "text_helper": helper["model"] if helper else None,
                     "text_latency_ms": helper["latency_ms"] if helper else 0,
+                    # Las cuatro cosas que consumen un paso, separadas: pensar
+                    # (`latency_ms`), escribir el valor (`text_latency_ms`),
+                    # pulsar (`act_ms`) y volver a mirar (`settle_ms` mas
+                    # `capture_ms`, que llegan del observe de abajo). Un total
+                    # solo dice que el paso tardo; esto dice por que.
+                    "act_ms": act_ms,
+                    "settle_ms": None,
+                    "capture_ms": None,
                     "operation": decision["operation"],
                     "target": decision["target"],
                     "page_changed": None,
@@ -168,10 +188,13 @@ class Agent:
             )
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+            observed = state["page"].get("timing") or {}
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
                 url=state["page"]["url"],
                 elapsed_ms=state["elapsed_ms"],
+                settle_ms=observed.get("settle_ms"),
+                capture_ms=observed.get("capture_ms"),
             )
             if state["record"]:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
