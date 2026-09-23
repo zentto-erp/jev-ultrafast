@@ -1269,7 +1269,7 @@ def browser_operation(request):
             .filter(r => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest')
             .slice(-120)
             .map(r => {
-              let where = r.name, third = false;
+              let where = r.name, third = false, host = '';
               try {
                 const u = new URL(r.name);
                 // 🚨 El host solo se tira si es NUESTRO. Recortando siempre a
@@ -1290,9 +1290,19 @@ def browser_operation(request):
                 const raiz = (h) => h.split('.').slice(-2).join('.');
                 third = raiz(u.hostname) !== raiz(location.hostname);
                 where = third ? (u.host + u.pathname + u.search) : (u.pathname + u.search);
+                // El host va aparte, SIEMPRE. La direccion corta es para quien
+                // lee el informe de un vistazo; el host es para quien tiene que
+                // averiguar donde fue a parar la llamada.
+                //
+                // Sin el, un `/v1/algo` que fallo parece una llamada relativa
+                // que cayo en el propio frontend, y eso apunta a un bug de
+                // configuracion que no existe. Paso: se diagnostico una URL base
+                // vacia sobre una llamada que iba perfectamente a su servicio.
+                // La pista que lo habria evitado costaba un campo.
+                host = u.host;
               } catch {}
               const status = r.responseStatus ?? null;
-              return {url: where.slice(0, 200), status, ms: Math.round(r.duration), third_party: third,
+              return {url: where.slice(0, 200), host, status, ms: Math.round(r.duration), third_party: third,
                       // A zero or absent status is a request that never got an
                       // answer — refused, blocked by CORS, DNS gone. Those are
                       // the ones that leave the screen emptiest.
