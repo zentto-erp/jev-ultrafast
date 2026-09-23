@@ -128,35 +128,69 @@ def test_viewport_is_pinned_by_default(fake):
     assert overrides and overrides[0]["width"] == 1120 and overrides[0]["height"] == 780
 
 
+def ventana(recorder, ancho, alto, cromo=88, emulado=(1120, 780)):
+    """Un navegador con su ventana, y una pagina que ya viene emulada.
+
+    Lo segundo no es rebuscado: es el estado normal a partir del segundo paso de
+    un recorrido, y el que destapo el fallo.
+    """
+
+    def answer(method, **params):
+        if method == "Browser.getWindowForTarget":
+            return {"windowId": 1, "bounds": {"width": ancho, "height": alto,
+                                              "windowState": "maximized"}}
+        if method == "Runtime.evaluate":
+            expression = params.get("expression", "")
+            if "outerHeight" in expression:
+                return {"result": {"value": cromo}}
+            if "innerWidth" in expression:
+                # Lo que responderia una pagina YA emulada: el tamaño falso.
+                return {"result": {"value": list(emulado)}}
+        return FakeCdp.__call__(recorder, method, **params)
+
+    return answer
+
+
 def test_viewport_can_follow_the_real_window(monkeypatch):
     """Watching a wide window at 1120px hides what the layout does at its real
     width, so a run cannot find a problem that only appears there."""
     recorder = FakeCdp()
-
-    def answer(method, **params):
-        if method == "Runtime.evaluate" and "innerWidth" in params.get("expression", ""):
-            return {"result": {"value": [1920, 1040]}}
-        return FakeCdp.__call__(recorder, method, **params)
-
-    monkeypatch.setattr(browser_mod, "cdp", answer)
+    monkeypatch.setattr(browser_mod, "cdp", ventana(recorder, 1936, 1048))
     monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
     monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
 
     Browser("https://example.test/", viewport="window")
     overrides = [p for m, p in recorder.calls if m == "Emulation.setDeviceMetricsOverride"]
-    assert overrides and overrides[0]["width"] == 1920 and overrides[0]["height"] == 1040
+    assert overrides and overrides[0]["width"] == 1920 and overrides[0]["height"] == 960
+
+
+def test_el_tamano_se_le_pregunta_al_navegador_no_a_la_pagina(monkeypatch):
+    """Una pagina ya emulada responde el tamaño FALSO, y el modo que existe para
+    seguir la pantalla real acabaria perpetuandolo.
+
+    Nadie lo notaria, porque el numero que informa es coherente consigo mismo.
+    Medido sobre el ERP: ventana maximizada a 1936 y pagina observada a 1120, con
+    media ventana en blanco y la rejilla escondiendo su columna de acciones — que
+    es donde estan los botones que el recorrido tiene que pulsar, y un control
+    fuera del viewport no se puede aimar.
+    """
+    recorder = FakeCdp()
+    monkeypatch.setattr(browser_mod, "cdp",
+                        ventana(recorder, 1936, 1048, emulado=(1120, 780)))
+    monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
+
+    Browser("https://example.test/", viewport="window")
+    aplicado = [p for m, p in recorder.calls if m == "Emulation.setDeviceMetricsOverride"]
+    assert aplicado, "tiene que aplicar un tamaño"
+    assert aplicado[0]["width"] != 1120, "esta perpetuando el tamaño emulado"
+    assert aplicado[0]["width"] == 1920
 
 
 def test_unusable_window_size_clears_the_override(monkeypatch):
     """Zero is not a size: emulating it would blank the page."""
     recorder = FakeCdp()
-
-    def answer(method, **params):
-        if method == "Runtime.evaluate" and "innerWidth" in params.get("expression", ""):
-            return {"result": {"value": [0, 0]}}
-        return FakeCdp.__call__(recorder, method, **params)
-
-    monkeypatch.setattr(browser_mod, "cdp", answer)
+    monkeypatch.setattr(browser_mod, "cdp", ventana(recorder, 0, 0, cromo=0))
     monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
     monkeypatch.setattr(browser_mod.time, "sleep", lambda _s: None)
 

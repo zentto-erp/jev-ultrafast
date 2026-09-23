@@ -440,18 +440,41 @@ class Browser:
         if viewport in (None, "none"):
             return
         if viewport == "window":
-            size = self.evaluate(
-                "(() => [window.innerWidth || 0, window.innerHeight || 0])()"
-            )
-            if isinstance(size, list) and len(size) == 2 and all(size):
-                width, height = int(size[0]), int(size[1])
-                # An override of 0 disables emulation entirely, which is what we
-                # want if the tab could not report a usable size.
+            # SE LE PREGUNTA AL NAVEGADOR, NO A LA PAGINA.
+            #
+            # `innerWidth` devuelve el tamaño EMULADO cuando ya hay una emulacion
+            # puesta — de un paso anterior, o de otra herramienta que uso esta
+            # misma pestaña. El modo que existe para seguir la pantalla real
+            # acabaria perpetuando el tamaño falso, y nadie lo notaria porque el
+            # numero que informa es coherente consigo mismo. Limpiar antes de
+            # medir tampoco basta: una emulacion puesta desde OTRA sesion CDP
+            # sobre el mismo target sigue en pie, y en un recorrido largo hay
+            # varias sesiones vivas sobre la misma pestaña.
+            #
+            # Medido sobre el ERP en una pantalla de 1920: la ventana estaba
+            # maximizada a 1936 y la pagina se observaba a 1120, con media
+            # ventana en blanco y la rejilla con scroll horizontal escondiendo la
+            # columna de acciones — justo donde estan los botones que el
+            # recorrido tiene que pulsar. Un control fuera del viewport no se
+            # puede aimar, asi que eso no es un problema estetico.
+            #
+            # `Browser.getWindowForTarget` da el marco real. El cromo (barras,
+            # pestañas) se mide en vez de estimarse: es lo que separa el alto de
+            # la ventana del alto util.
+            try:
+                bounds = cdp("Browser.getWindowForTarget", targetId=self.target)["bounds"]
+                chrome = self.evaluate("(() => (outerHeight || 0) - (innerHeight || 0))()")
+                width = int(bounds["width"]) - 16
+                height = int(bounds["height"]) - int(chrome or 90)
+            except Exception:
+                width = height = 0
+            if width > 200 and height > 200:
                 self.call(
                     "Emulation.setDeviceMetricsOverride",
                     width=width, height=height, deviceScaleFactor=1, mobile=False,
                 )
                 return
+            # Sin un tamaño usable, quitar la emulacion es mejor que inventar uno.
             self.call("Emulation.clearDeviceMetricsOverride")
             return
 
