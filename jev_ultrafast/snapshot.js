@@ -415,8 +415,42 @@
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     document.title,text,semantics,page_key[6]];
-  const omitted_actions=Math.max(0,actions.length-MAX_ACTIONS);
-  actions.splice(MAX_ACTIONS);
+  // ── El tope no se puede comer el paso siguiente ───────────────────────
+  //
+  // El tope existe para una tabla densa, donde recoger mil celdas no ayuda a
+  // nadie. Las opciones de un desplegable abierto son otra cosa: son el UNICO
+  // paso que continua lo que se acaba de escribir. Y son las ultimas en
+  // recogerse, porque un autocompletado se pinta en un portal al final del
+  // documento — de modo que en una pantalla con muchos controles son
+  // exactamente lo que el tope descarta.
+  //
+  // Medido: el campo queda escrito, ninguna sugerencia ofrecida, y el recorrido
+  // se para a un clic del final diciendo que no puede seguir. Es el fallo que
+  // se vio en las aptitudes y el sector de LinkedIn, que no tenia nada que ver
+  // con no saber elegir una sugerencia: no se le ofrecia ninguna.
+  const openCombobox=[...crossRoots('[aria-expanded="true"]')].some(
+    e=>e.getAttribute('role')==='combobox' || e.hasAttribute('aria-autocomplete'));
+  const urgent=[], rest=[];
+  for (const a of actions) {
+    let emergent=false;
+    if (a.role==='option') {
+      // Con un combobox declarado abierto basta. Si no lo declara —que pasa, y
+      // mas de lo que deberia— sirve la senal que el autor ya le dio al
+      // usuario: un desplegable emergente se pinta flotando, no en el flujo.
+      if (openCombobox) emergent=true;
+      else {
+        const e=cache.nodes.get(a.node);
+        const box=e && (closestDeep(e,'[role="listbox"],[role="menu"]') || e.parentElement);
+        emergent=!!box && ['absolute','fixed'].includes(getComputedStyle(box).position);
+      }
+    }
+    (emergent ? urgent : rest).push(a);
+  }
+  const ordered=[...urgent,...rest];
+  const omitted_actions=Math.max(0,ordered.length-MAX_ACTIONS);
+  ordered.splice(MAX_ACTIONS);
+  actions.length=0;
+  actions.push(...ordered);
   actions.forEach((a,i)=>a.id='e'+(i+1));
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
