@@ -1038,6 +1038,26 @@ class Browser:
         """Si la pestana que se conduce ahora es de las que abrimos."""
         return self.target in self.owned
 
+    @owns_target.setter
+    def owns_target(self, mia):
+        """Adoptar o soltar la pestana que se conduce.
+
+        Existe porque esto era un atributo normal y habia codigo que lo ESCRIBIA
+        — un puente que conduce el navegador de otro le dice "esta no es tuya"
+        para que no la cierre al terminar. Al convertirlo en propiedad calculada
+        ese codigo empezo a reventar con "property has no setter", y el fallo
+        aparecia lejos de su causa: un recorrido que no hacia nada, sin mas
+        explicacion que un resumen vacio.
+
+        Una propiedad que sustituye a un atributo tiene que admitir lo que el
+        atributo admitia, o deja de ser un detalle interno y pasa a ser un cambio
+        de contrato.
+        """
+        if mia:
+            self.owned.add(self.target)
+        else:
+            self.owned.discard(self.target)
+
     def tabs(self):
         """Las pestanas abiertas, con la que se conduce marcada.
 
@@ -1973,6 +1993,41 @@ def browser_operation(request):
                             time.sleep(per_key / 1000.0)
                     else:
                         call("Input.insertText", text=request["text"])
+                    # ── Salir del campo ───────────────────────────────────
+                    #
+                    # Una persona que rellena un formulario SIEMPRE sale del
+                    # campo: pulsa Tab, o hace clic en el siguiente. El motor no
+                    # lo hacia, y hay campos que solo confirman su valor al
+                    # salir — el componente guarda en `onBlur`, no en cada
+                    # pulsacion. El efecto es cruel: el valor se ve escrito en la
+                    # pantalla, pero el formulario no lo tiene, y al guardar
+                    # responde que ese campo obligatorio esta vacio. Quien mira
+                    # el video ve el numero puesto y un rechazo que no cuadra.
+                    #
+                    # Medido en la compra del ERP: el numero de control quedaba
+                    # escrito y el guardado lo rechazaba igual.
+                    #
+                    # NO se sale si hay un desplegable esperando. Un campo de
+                    # autocompletado acaba de abrir sus sugerencias, y salir las
+                    # cierra: se perderia justo el paso siguiente, que es
+                    # elegir una. Ahi el blur llega solo, cuando se pulsa la
+                    # sugerencia.
+                    call(
+                        "Runtime.evaluate",
+                        expression="""(node => {
+                          const el = window.__jevFast?.nodes.get(node);
+                          if (!el) return 'sin nodo';
+                          const abierto = el.getAttribute('aria-expanded') === 'true';
+                          const lista = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+                          const opciones = lista
+                            ? (document.getElementById(lista)?.querySelectorAll('[role="option"]').length || 0)
+                            : document.querySelectorAll('[role="listbox"] [role="option"]').length;
+                          if (abierto || opciones > 0) return 'desplegable abierto, no se sale';
+                          el.blur?.();
+                          return 'salido';
+                        })(""" + json.dumps(action["node"]) + ")",
+                        returnByValue=True,
+                    )
         return {"executed": action["id"]}
 
     scope, ignore = request.get("scope"), request.get("ignore")

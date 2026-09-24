@@ -251,3 +251,27 @@ def test_sin_foto_inicial_solo_se_ofrecen_las_que_abrio_el_recorrido(monkeypatch
     # que NO debe pasar: se cae al criterio seguro, las que abrimos nosotros.
     ofrecidas = [a for a in page["actions"] if a["kind"] == "tab"]
     assert [a["label"] for a in ofrecidas] == [], "sin foto inicial no se adivina"
+
+
+def test_la_propiedad_sigue_admitiendo_que_se_le_asigne(fake):
+    """Era un atributo normal y habia codigo que lo ESCRIBIA.
+
+    Un puente que conduce el navegador de otro —el que graba un video, por
+    ejemplo— le dice "esta pestana no es tuya" para que no la cierre al
+    terminar. Al convertirlo en propiedad calculada eso reventaba con "property
+    has no setter", y el fallo aparecia lejos de su causa: el recorrido no hacia
+    nada y el unico rastro era un resumen vacio.
+
+    Una propiedad que sustituye a un atributo tiene que admitir lo que el
+    atributo admitia, o no es un detalle interno: es un cambio de contrato.
+    """
+    browser = Browser("https://uno.test/")          # abre la suya, luego es suya
+    assert browser.owns_target is True
+
+    browser.owns_target = False                      # el puente la suelta
+    assert browser.owns_target is False
+    browser.close()
+    assert fake.closed == [], "soltada, el cierre no se la lleva"
+
+    browser.owns_target = True                       # y se puede volver a adoptar
+    assert browser.owns_target is True
