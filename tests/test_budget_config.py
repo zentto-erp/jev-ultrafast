@@ -1,7 +1,6 @@
 """The action budget is a policy, not a property of the engine."""
 
 import importlib
-import os
 
 import pytest
 

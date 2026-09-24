@@ -14,6 +14,131 @@ HTML = """<!doctype html><title>Guard checks</title>
 <p id="outside">Unrelated offscreen text</p>"""
 
 
+# Una pantalla con mas controles de los que caben en el tope, y un autocompletado
+# encima. Es la unica forma de reproducir el fallo: en una pagina pequena las
+# sugerencias caben siempre y todo parece correcto.
+CROWDED = """<!doctype html><title>Crowded screen</title>
+<style>#portal{position:absolute;background:#fff;border:1px solid #ccc}
+#portal [role=option]{padding:6px}</style>
+<label>Sector<input id="sector" role="combobox" aria-expanded="false"
+  aria-controls="portal" aria-autocomplete="list" autocomplete="off"></label>
+<div id="filler"></div>
+<!-- El portal va DESPUES de los controles, que es donde lo inyecta una
+     aplicacion real: al final del body, por encima de todo. Ponerlo antes hacia
+     que sus opciones se recogieran primero y sobrevivieran al tope sin
+     esfuerzo — el guard pasaba con y sin el arreglo, y por tanto no probaba
+     nada. El orden del DOM ES el caso. -->
+<div id="portal" role="listbox" hidden></div>
+<script>
+  const OPTIONS=["Software","Software de contabilidad","Servicios financieros"];
+  const field=document.querySelector('#sector'), portal=document.querySelector('#portal');
+  // Mas controles que el tope, para que las sugerencias tengan que competir.
+  document.querySelector('#filler').innerHTML=
+    Array.from({length:300},(_,i)=>'<button>Row action '+i+'</button>').join('');
+  field.addEventListener('input',()=>{
+    const hit=OPTIONS.filter(o=>o.toLowerCase().includes(field.value.toLowerCase()));
+    if (!field.value || !hit.length) { portal.hidden=true; field.setAttribute('aria-expanded','false'); return; }
+    const box=field.getBoundingClientRect();
+    portal.style.left=(box.left+scrollX)+'px';
+    portal.style.top=(box.bottom+scrollY)+'px';
+    portal.innerHTML=hit.map(o=>'<div role=option>'+o+'</div>').join('');
+    portal.hidden=false;
+    field.setAttribute('aria-expanded','true');
+  });
+  portal.addEventListener('click',e=>{
+    const chosen=e.target.closest('[role=option]');
+    if (!chosen) return;
+    field.value=chosen.textContent;
+    portal.hidden=true;
+    field.setAttribute('aria-expanded','false');
+  });
+</script>"""
+
+
+# La forma de cualquier pantalla de aplicacion: cabecera, trabajo, pie y un aviso
+# de cookies. Los tres que no son el trabajo tienen controles perfectamente
+# clicables, y ninguno puede ser la respuesta correcta.
+SCOPED = """<!doctype html><title>Scoped screen</title>
+<nav><button>Menu uno</button><button>Menu dos</button></nav>
+<main id="work"><button>Guardar</button><label>Cantidad<input></label></main>
+<footer><button>Aviso legal</button></footer>
+<div class="banner"><button>Aceptar cookies</button></div>"""
+
+
+def scoping_removes_what_cannot_be_right():
+    """Acotar no es reducir tamano: es quitar de la mesa lo que no puede acertar.
+
+    Y lo que NO puede pasar es pedir una parte y recibir la pantalla entera en
+    silencio. Ahi el recorrido decide sobre algo distinto de lo que cree y no hay
+    nada en la salida que lo delate, que es peor que no poder acotar.
+    """
+    browser = Browser("data:text/html," + quote(SCOPED))
+    passed = []
+    try:
+        whole = {a.get("label") for a in browser.observe(screenshot=False)["actions"]}
+        assert {"Menu uno", "Aviso legal", "Aceptar cookies", "Guardar"} <= whole, whole
+
+        scoped = browser.observe(screenshot=False, scope="#work")
+        labels = {a.get("label") for a in scoped["actions"]}
+        assert "Guardar" in labels, labels
+        intruders = {"Menu uno", "Menu dos", "Aviso legal", "Aceptar cookies"} & labels
+        assert not intruders, intruders
+        assert scoped["scope"] == "#work" and scoped["scope_missing"] is False
+        passed.append("scoping offers the work and drops the chrome around it")
+
+        ignored = browser.observe(screenshot=False, ignore=[".banner", "footer"])
+        labels = {a.get("label") for a in ignored["actions"]}
+        assert "Menu uno" in labels, "excluir no es acotar: el resto sigue estando"
+        assert not ({"Aviso legal", "Aceptar cookies"} & labels)
+        passed.append("ignored regions disappear while the rest stays")
+
+        missing = browser.observe(screenshot=False, scope="#nowhere")
+        assert missing["scope_missing"] is True
+        assert "Menu uno" in {a.get("label") for a in missing["actions"]}
+        passed.append("a scope that is not there observes everything AND says so")
+
+        back = browser.observe(screenshot=False)
+        assert back["scope"] is None and not back["scope_missing"]
+        assert "Menu uno" in {a.get("label") for a in back["actions"]}
+        passed.append("a scope does not stick to the next observation")
+    finally:
+        browser.close()
+    return passed
+
+
+def crowded_screen_keeps_the_suggestions():
+    """El tope no se puede comer el unico paso que continua lo escrito.
+
+    Un autocompletado se pinta en un portal al final del documento, asi que sus
+    opciones son las ultimas en recogerse — y en una pantalla con mas controles
+    que el tope son exactamente lo que se descarta. El sintoma no parece un tope:
+    el campo queda escrito, no hay ninguna sugerencia ofrecida y el recorrido se
+    para diciendo que no puede seguir, a un clic del final. Fue el fallo de las
+    aptitudes y el sector de LinkedIn, que nunca tuvo que ver con no saber elegir
+    una sugerencia.
+    """
+    browser = Browser("data:text/html," + quote(CROWDED))
+    passed = []
+    try:
+        page = browser.observe(screenshot=False)
+        assert page["omitted_actions"] > 0, "la pantalla tiene que agotar el tope para probar esto"
+        field = next(a for a in page["actions"] if a["kind"] == "fill")
+        browser.act(field, page, text="Software")
+
+        page = browser.observe(screenshot=False)
+        options = [a for a in page["actions"] if a.get("role") == "option"]
+        assert options, "con el tope agotado, las sugerencias tienen que seguir ofreciendose"
+        passed.append(f"a crowded screen still offers its {len(options)} live suggestions")
+
+        browser.act(options[0], page)
+        chosen = browser.evaluate("document.querySelector('#sector').value")
+        assert chosen == "Software", repr(chosen)
+        passed.append("the offered suggestion is the one the page applies")
+    finally:
+        browser.close()
+    return passed
+
+
 def main():
     browser = Browser("data:text/html," + quote(HTML))
     passed = []
@@ -130,6 +255,8 @@ def main():
     finally:
         browser.close()
     print("\n".join(passed))
+    passed += crowded_screen_keeps_the_suggestions()
+    passed += scoping_removes_what_cannot_be_right()
     print(f"PASS: {len(passed)} browser guard checks; no model calls")
 
 

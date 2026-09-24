@@ -1,5 +1,6 @@
 """Observed actions through Browser Harness; one CDP session, no per-step subprocess."""
 
+import base64
 import hashlib
 import json
 import os
@@ -9,7 +10,6 @@ from pathlib import Path
 
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
-
 
 # CDP modifier bits: Alt 1, Ctrl 2, Meta 4, Shift 8.
 MODIFIERS = (("Alt", "AltLeft", 1), ("Control", "ControlLeft", 2),
@@ -237,6 +237,63 @@ def modifier_mask(names):
     return mask
 
 
+def pace():
+    """A que velocidad se opera el navegador. Dos usos, exigencias opuestas.
+
+    Cuando lo que se quiere es un RESULTADO —probar una pantalla, rellenar un
+    formulario, sacar unos datos— el ritmo ideal es ninguno: cuanto antes
+    termine, mejor, y nadie va a mirar el recorrido.
+
+    Cuando lo que se quiere es un VIDEO, ese mismo recorrido no sirve. Un clic
+    que ocurre en el mismo fotograma en que el cursor aparece no se ve: quien
+    mira no sabe donde se pulso, y el tutorial no ensena nada aunque cada paso
+    funcione. Ahi hacen falta las tres cosas que hace una persona sin pensarlo —
+    llevar el cursor hasta el control, detenerse un momento encima, y escribir a
+    un ritmo que se pueda leer.
+
+    Es la misma operacion; lo que cambia es para quien se hace. Por eso es un
+    ajuste y no dos motores: un recorrido grabado tiene que ejercitar
+    exactamente el mismo camino que el que se prueba, o el video ensena algo que
+    no es lo que la aplicacion hace.
+
+    `JEV_PACE=human` (o `video`) lo activa; el valor por defecto deja todo como
+    estaba.
+    """
+    modo = (os.environ.get("JEV_PACE") or "fast").strip().lower()
+    if modo in {"human", "humano", "video"}:
+        return {
+            "modo": "human",
+            # Pasos intermedios hasta el control. Un solo evento en el destino es
+            # indistinguible de no haberse movido nunca.
+            "aproximar": 12,
+            "antes_del_clic": 0.35,
+            "despues_del_clic": 0.55,
+            "por_tecla_ms": 110,
+        }
+    return {"modo": "fast", "aproximar": 0, "antes_del_clic": 0.0,
+            "despues_del_clic": 0.0, "por_tecla_ms": 0}
+
+
+def approach(call, x, y, ritmo):
+    """Llevar el cursor hasta el punto, de forma que se vea que llego.
+
+    No es decoracion: el `mousemove` tambien dispara los `hover` de la pagina, y
+    hay menus que solo se despliegan al pasar por encima. Un clic teletransportado
+    se salta ese estado intermedio.
+    """
+    pasos = ritmo["aproximar"]
+    if pasos <= 0:
+        return
+    for n in range(1, pasos + 1):
+        # Desde arriba-izquierda del objetivo, acercandose. El arranque no
+        # importa: lo que importa es que haya recorrido.
+        avance = n / pasos
+        call("Input.dispatchMouseEvent", type="mouseMoved",
+             x=x - 90 * (1 - avance), y=y - 60 * (1 - avance))
+        time.sleep(0.016)
+    time.sleep(ritmo["antes_del_clic"])
+
+
 def snapshot_budgets():
     """Caps the observation applies, overridable per run.
 
@@ -267,23 +324,87 @@ def harvest_script():
     return (Path(__file__).parent / "harvest.js").read_text(encoding="utf-8")
 
 
-def read_state_script():
-    """The observation, with this run's budgets attached."""
+def read_state_script(scope=None, ignore=None):
+    """The observation, with this run's budgets and scope attached.
+
+    El alcance va DENTRO de la misma expresion, no en una evaluacion previa. Una
+    observacion es una sola lectura del navegador —contenido y controles a la
+    vez, preservando la identidad de los nodos— y partirla en dos abre una
+    rendija entre fijar el alcance y leer con el: en esa rendija la pagina puede
+    cambiar, y el resultado seria un estado que no existio nunca. Hay un test que
+    cuenta las evaluaciones precisamente por esto.
+
+    Ademas se escribe siempre, tambien cuando no se acota, porque un alcance que
+    se quedara pegado de la observacion anterior haria que el paso siguiente
+    decidiera sobre un trozo de pantalla que nadie pidio.
+    """
     source = Path(__file__).with_name("snapshot.js").read_text()
-    return f"(() => {{ window.__jevBudgets={json.dumps(snapshot_budgets())}; return {source}; }})()"
+    return (f"(() => {{ window.__jevBudgets={json.dumps(snapshot_budgets())};"
+            f" window.__jevScope={json.dumps(scope)};"
+            f" window.__jevIgnore={json.dumps(ignore or [])};"
+            f" return {source}; }})()")
 
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = read_state_script()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
+def page_targets():
+    """Las pestanas de aplicacion abiertas ahora mismo, en el orden que da Chrome.
+
+    Se dejan fuera las pantallas del propio navegador. Existen y son targets,
+    pero no son pantallas de la aplicacion: ofrecerlas a un agente solo le da
+    opciones que nunca son la correcta.
+    """
+    # Una respuesta sin `targetInfos` es "no lo se", NO "no hay ninguna". Devolver
+    # una lista vacia ahi seria convertir el desconocimiento en un dato: quien
+    # pregunte concluira que el navegador esta limpio, y entonces cualquier
+    # pestana que ya estuviera abierta pasara por recien aparecida. Se levanta y
+    # que decida cada sitio como degradar, porque no degradan igual — el
+    # constructor se queda sin foto inicial, la observacion no ofrece pestanas.
+    answer = cdp("Target.getTargets")
+    if "targetInfos" not in answer:
+        raise LookupError("Target.getTargets no devolvio targetInfos")
+    pages = []
+    for info in answer["targetInfos"]:
+        if info.get("type") != "page":
+            continue
+        if info.get("url", "").startswith(("devtools://", "chrome://", "chrome-extension://")):
+            continue
+        pages.append(info)
+    return pages
+
+
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
 class Browser:
-    def __init__(self, url, *, reuse_target=None, viewport="fixed"):
+    def __init__(self, url, *, reuse_target=None, viewport="fixed", scope=None, ignore=None):
         ensure_daemon()
+        # Las pestanas que ya estaban abiertas antes de empezar son del usuario,
+        # y el recorrido no tiene nada que hacer en ellas.
+        #
+        # Medido al probar esto contra el Chrome del perfil de pruebas: habia
+        # QUINCE pestanas de sesiones anteriores —X, Facebook, LinkedIn, Meta
+        # Business Suite— y la observacion las ofrecia todas. Eso no es una
+        # capacidad nueva, es quince opciones de ruido en el espacio de
+        # decision, cada una de ellas incorrecta, compitiendo con los controles
+        # de la pantalla que si importan. Empeoraba la decision.
+        #
+        # Lo que el agente necesita saber no es que pestanas existen: es cual
+        # acaba de aparecer, porque eso es lo que hizo el click anterior.
+        try:
+            self.tabs_before = {info["targetId"] for info in page_targets()}
+        except Exception:
+            # `None` y no un conjunto vacio: son dos cosas distintas y la
+            # diferencia importa. Un conjunto vacio significa "no habia ninguna
+            # pestana antes", y entonces TODAS aparecieron durante el recorrido
+            # —incluidas las quince del usuario—, que es justo el ruido que este
+            # filtro existe para quitar. `None` significa "no lo se", y ante eso
+            # solo se ofrecen las que abrimos nosotros, que es la unica cosa que
+            # sabemos sin preguntarle al navegador.
+            self.tabs_before = None
         # A fresh background tab per run is right for benchmarks: runs stay
         # isolated and the user's Chrome never steals focus. It is wrong when a
         # person is watching a sequence of runs, because every run opens another
@@ -292,8 +413,21 @@ class Browser:
         self.target = reuse_target or cdp(
             "Target.createTarget", url="about:blank", background=True
         )["targetId"]
-        self.owns_target = reuse_target is None
+        # Que pestanas son nuestras, no si LA pestana es nuestra. En cuanto un
+        # recorrido puede abrir otra y cambiarse a ella, una sola bandera ya no
+        # sabe responder: al cerrar habria que cerrar la que abrimos y dejar en
+        # pie la prestada, y con un booleano se pierde una de las dos.
+        self.owned = set() if reuse_target else {self.target}
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        # Se recuerda porque la emulacion es por sesion: al cambiar de pestana
+        # hay que volver a aplicarla, y sin guardarla no hay que aplicar.
+        self._viewport = viewport
+        # El alcance por defecto del recorrido. Se guarda aqui y no se pasa en
+        # cada llamada para que TODAS las observaciones lo hereden — incluida la
+        # que hace el bucle tras actuar, que es la que decide el paso siguiente.
+        # Con el alcance en la llamada, cualquier observacion que alguien olvide
+        # acotar devuelve la pantalla entera y deshace el acotado sin avisar.
+        self.scope, self.ignore = scope, ignore
         self._apply_viewport(viewport)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
@@ -363,18 +497,53 @@ class Browser:
         if viewport in (None, "none"):
             return
         if viewport == "window":
-            size = self.evaluate(
-                "(() => [window.innerWidth || 0, window.innerHeight || 0])()"
-            )
-            if isinstance(size, list) and len(size) == 2 and all(size):
-                width, height = int(size[0]), int(size[1])
-                # An override of 0 disables emulation entirely, which is what we
-                # want if the tab could not report a usable size.
+            # SE LE PREGUNTA AL NAVEGADOR, NO A LA PAGINA.
+            #
+            # `innerWidth` devuelve el tamaño EMULADO cuando ya hay una emulacion
+            # puesta — de un paso anterior, o de otra herramienta que uso esta
+            # misma pestaña. El modo que existe para seguir la pantalla real
+            # acabaria perpetuando el tamaño falso, y nadie lo notaria porque el
+            # numero que informa es coherente consigo mismo. Limpiar antes de
+            # medir tampoco basta: una emulacion puesta desde OTRA sesion CDP
+            # sobre el mismo target sigue en pie, y en un recorrido largo hay
+            # varias sesiones vivas sobre la misma pestaña.
+            #
+            # Medido sobre el ERP en una pantalla de 1920: la ventana estaba
+            # maximizada a 1936 y la pagina se observaba a 1120, con media
+            # ventana en blanco y la rejilla con scroll horizontal escondiendo la
+            # columna de acciones — justo donde estan los botones que el
+            # recorrido tiene que pulsar. Un control fuera del viewport no se
+            # puede aimar, asi que eso no es un problema estetico.
+            #
+            # `Browser.getWindowForTarget` da el marco real. El cromo (barras,
+            # pestañas) se mide en vez de estimarse: es lo que separa el alto de
+            # la ventana del alto util.
+            try:
+                bounds = cdp("Browser.getWindowForTarget", targetId=self.target)["bounds"]
+                # El cromo del navegador —barras y pestañas— medido, pero con un
+                # rango de cordura. En una pestaña de FONDO `outerHeight` vale 0,
+                # asi que la resta sale negativa y el alto acaba siendo mayor que
+                # la ventana: medido, 1993 de alto en una pantalla de 1080. Una
+                # pagina emulada al doble de su altura no falla de forma visible
+                # — simplemente se observa una pantalla que no existe, con todo
+                # "dentro del viewport" y nada donde el usuario lo ve.
+                medido = self.evaluate("(() => (outerHeight || 0) - (innerHeight || 0))()")
+                try:
+                    medido = int(medido)
+                except (TypeError, ValueError):
+                    medido = 0
+                chrome = medido if 40 <= medido <= 220 else 90
+                width = int(bounds["width"]) - 16
+                height = int(bounds["height"]) - chrome
+            except Exception:
+                width = height = 0
+            if width > 200 and height > 200:
                 self.call(
                     "Emulation.setDeviceMetricsOverride",
                     width=width, height=height, deviceScaleFactor=1, mobile=False,
                 )
                 return
+            # Sin un tamaño usable, quitar la emulacion es mejor que inventar uno.
             self.call("Emulation.clearDeviceMetricsOverride")
             return
 
@@ -468,7 +637,15 @@ class Browser:
             # step that was actually asked for.
             return False
 
-    def observe(self, screenshot=True):
+    def observe(self, screenshot=True, scope=None, ignore=None):
+        scope = self.scope if scope is None else scope
+        ignore = self.ignore if ignore is None else ignore
+        # El reloj empieza aqui porque una observacion son dos cosas distintas
+        # con causas distintas: esperar a que la pagina se quede quieta, y
+        # capturarla. Sumadas dan un numero que no dice donde mirar — y en una
+        # aplicacion de micro-frontends la espera puede ser diez veces la
+        # captura sin que nada este roto.
+        started = time.perf_counter()
         self.rearm_if_needed()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
@@ -511,16 +688,62 @@ class Browser:
                 self.wait_until_settled(timeout=5, quiet_for=0.25)
             except Exception:
                 pass
+        settled = time.perf_counter()
         for attempt in range(10):
             try:
-                return browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
+                page = browser_operation(
+                    {"operation": "observe", "session": self.session, "screenshot": screenshot,
+                     "scope": scope, "ignore": ignore}
                 )
+                # Los reintentos cuentan dentro de la captura a proposito: son
+                # tiempo que el paso pago de verdad.
+                page["timing"] = {
+                    "settle_ms": round((settled - started) * 1000),
+                    "capture_ms": round((time.perf_counter() - settled) * 1000),
+                }
+                self.offer_other_tabs(page)
+                return page
             except StalePage:
                 if attempt == 9:
                     raise
                 time.sleep(0.02)
         raise StalePage("Page did not settle")
+
+    def offer_other_tabs(self, page):
+        """Poner las demas pestanas en la observacion, como operaciones.
+
+        Van despues del tope de acciones a proposito: una pestana no compite por
+        sitio con los controles de la pantalla, y descartarla por un tope
+        pensado para una tabla densa dejaria al agente sin ver donde ocurrio el
+        trabajo.
+
+        No entran en la huella. Que aparezca una pestana no cambia la pagina
+        sobre la que se acaba de decidir, y tratarlo como cambio obligaria a
+        repetir una decision que sigue siendo valida — con el efecto colateral
+        de que una aplicacion que abre una ventana emergente al cargar dejaria
+        el recorrido en bucle.
+        """
+        try:
+            others = [tab for tab in self.tabs()
+                      if not tab["driving"] and (tab["ours"] or tab["appeared"])]
+        except Exception:
+            # Saber que otras pestanas hay es una ayuda, no un requisito. Si el
+            # navegador no contesta, la observacion sigue siendo buena.
+            return page
+        page["tabs"] = others
+        for position, tab in enumerate(others, start=1):
+            name = (tab["title"] or tab["url"] or "sin titulo").strip()
+            # Se dice que se abrio durante el recorrido porque eso es la razon
+            # para mirarla: casi siempre la abrio el paso anterior.
+            page["actions"].append({
+                "id": f"TAB_{position}",
+                "kind": "tab",
+                "node": None,
+                "target": tab["target"],
+                "label": f"Ir a la pestana abierta durante el recorrido: {name[:80]}",
+                "url": tab["url"],
+            })
+        return page
 
     def fresh(self, page, action=None):
         if action is not None and action["kind"] in {"click", "select"}:
@@ -796,11 +1019,139 @@ class Browser:
         return browser_operation({"operation": "touch", "session": self.session,
                                   "enabled": enabled, "points": points})
 
+    # ─── Pestanas ─────────────────────────────────────────────────────────
+    #
+    # Un sistema web no cabe en una pestana. El ERP abre el PDF de la factura,
+    # la vista de impresion o un selector en otra, y hasta ahora el agente se
+    # quedaba mirando la que ya conocia y concluia que el boton no habia hecho
+    # nada. No era un fallo de la aplicacion: la mitad del trabajo ocurria donde
+    # nadie miraba.
+    #
+    # Se ofrecen al modelo como operaciones, igual que las teclas de funcion, y
+    # por el mismo motivo: una pestana no es un elemento del DOM, asi que no
+    # puede ser el objetivo de un click. Que aparezca una nueva es informacion
+    # que cambia el siguiente paso, y por tanto tiene que estar en la
+    # observacion y no en la cabeza de quien la lanzo.
+
+    @property
+    def owns_target(self):
+        """Si la pestana que se conduce ahora es de las que abrimos."""
+        return self.target in self.owned
+
+    @owns_target.setter
+    def owns_target(self, mia):
+        """Adoptar o soltar la pestana que se conduce.
+
+        Existe porque esto era un atributo normal y habia codigo que lo ESCRIBIA
+        — un puente que conduce el navegador de otro le dice "esta no es tuya"
+        para que no la cierre al terminar. Al convertirlo en propiedad calculada
+        ese codigo empezo a reventar con "property has no setter", y el fallo
+        aparecia lejos de su causa: un recorrido que no hacia nada, sin mas
+        explicacion que un resumen vacio.
+
+        Una propiedad que sustituye a un atributo tiene que admitir lo que el
+        atributo admitia, o deja de ser un detalle interno y pasa a ser un cambio
+        de contrato.
+        """
+        if mia:
+            self.owned.add(self.target)
+        else:
+            self.owned.discard(self.target)
+
+    def tabs(self):
+        """Las pestanas abiertas, con la que se conduce marcada.
+
+        Se excluyen las de herramientas del navegador: existen, pero no son
+        pantallas de la aplicacion y ofrecerlas solo da al modelo una opcion que
+        nunca es la correcta.
+        """
+        return [{
+            "target": info["targetId"],
+            "url": info.get("url", ""),
+            "title": info.get("title", ""),
+            "driving": info["targetId"] == self.target,
+            "ours": info["targetId"] in self.owned,
+            # Aparecio despues de empezar, asi que este recorrido pudo causarla.
+            # Sin foto inicial no se afirma: no saberlo no es que si.
+            "appeared": (self.tabs_before is not None
+                         and info["targetId"] not in self.tabs_before),
+        } for info in page_targets()]
+
+    def switch(self, target_id):
+        """Conducir otra pestana, sin cerrar la que se deja.
+
+        La que se abandona puede ser la del usuario y el paso siguiente puede
+        querer volver, asi que cambiar de pestana no destruye nada. Tampoco se
+        trae al frente: activarla robaria el foco de lo que la persona esta
+        mirando, y el motor ya sabe pintar una pestana de fondo.
+        """
+        if target_id not in {tab["target"] for tab in self.tabs()}:
+            raise ValueError(f"no hay ninguna pestana con id {target_id}")
+        self.target = target_id
+        self.session = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+        # La emulacion se aplica por sesion: al cambiar hay que repetirla o la
+        # pestana nueva se observa con la ventana en otro tamano, que es
+        # exactamente el fallo que `viewport` existe para evitar.
+        self._apply_viewport(self._viewport)
+        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.ensure_composited()
+        self.wait_until_settled()
+        # Un dialogo armado lo estaba para la sesion anterior. Se rearma en la
+        # siguiente observacion, que es donde ya se comprueba.
+        self.after_input = None
+        return {"driving": target_id, "tabs": self.tabs()}
+
+    def open_tab(self, url=None, switch=True, own=True):
+        """Abrir una pestana nueva, de fondo, y conducirla salvo que se diga que no.
+
+        `own=False` la abre sin adoptarla, para quien no puede ser su dueno: la
+        CLI es un proceso por paso, asi que una pestana suya moriria en el
+        `finally` del mismo comando que la abrio — y abrir una pestana que se
+        cierra sola no es abrir una pestana.
+        """
+        target_id = cdp("Target.createTarget", url=url or "about:blank", background=True)["targetId"]
+        if own:
+            self.owned.add(target_id)
+        if switch:
+            return self.switch(target_id)
+        return {"opened": target_id, "tabs": self.tabs()}
+
+    def close_tab(self, target_id=None):
+        """Cerrar una pestana; si es la que se conduce, pasar a otra que quede.
+
+        Quedarse conduciendo una pestana cerrada es un estado en el que todo
+        falla con un error que habla de sesiones y no de lo que paso, asi que se
+        resuelve aqui en vez de dejarlo para el primer paso siguiente.
+        """
+        target_id = target_id or self.target
+        cdp("Target.closeTarget", targetId=target_id)
+        self.owned.discard(target_id)
+        if target_id != self.target:
+            return {"closed": target_id, "tabs": self.tabs()}
+        self.target = None
+        remaining = [tab for tab in self.tabs() if tab["target"] != target_id]
+        if not remaining:
+            return {"closed": target_id, "driving": None, "tabs": []}
+        return {"closed": target_id, **self.switch(remaining[-1]["target"])}
+
+    def pdf(self, where):
+        """La pantalla tal como se imprimiria, que es la evidencia que se archiva."""
+        result = self.call("Page.printToPDF", printBackground=True)
+        Path(where).write_bytes(base64.b64decode(result["data"]))
+        return {"saved": str(Path(where).resolve()), "bytes": Path(where).stat().st_size}
+
     def close(self):
         # A borrowed tab is not ours to close: the caller is reusing it across
-        # runs, and closing it would defeat the reason for lending it.
-        if self.target and self.owns_target:
-            cdp("Target.closeTarget", targetId=self.target)
+        # runs, and closing it would defeat the reason for lending it. Lo que se
+        # cierra son las que abrimos nosotros, este conduciendo cual sea.
+        for target in list(self.owned):
+            try:
+                cdp("Target.closeTarget", targetId=target)
+            except Exception:
+                # Una pestana ya cerrada —por la propia pagina, o por el
+                # usuario— no es un fallo del cierre.
+                pass
+        self.owned.clear()
         self.target = None
 
 
@@ -938,7 +1289,7 @@ def browser_operation(request):
             .filter(r => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest')
             .slice(-120)
             .map(r => {
-              let where = r.name, third = false;
+              let where = r.name, third = false, host = '';
               try {
                 const u = new URL(r.name);
                 // 🚨 El host solo se tira si es NUESTRO. Recortando siempre a
@@ -959,9 +1310,19 @@ def browser_operation(request):
                 const raiz = (h) => h.split('.').slice(-2).join('.');
                 third = raiz(u.hostname) !== raiz(location.hostname);
                 where = third ? (u.host + u.pathname + u.search) : (u.pathname + u.search);
+                // El host va aparte, SIEMPRE. La direccion corta es para quien
+                // lee el informe de un vistazo; el host es para quien tiene que
+                // averiguar donde fue a parar la llamada.
+                //
+                // Sin el, un `/v1/algo` que fallo parece una llamada relativa
+                // que cayo en el propio frontend, y eso apunta a un bug de
+                // configuracion que no existe. Paso: se diagnostico una URL base
+                // vacia sobre una llamada que iba perfectamente a su servicio.
+                // La pista que lo habria evitado costaba un campo.
+                host = u.host;
               } catch {}
               const status = r.responseStatus ?? null;
-              return {url: where.slice(0, 200), status, ms: Math.round(r.duration), third_party: third,
+              return {url: where.slice(0, 200), host, status, ms: Math.round(r.duration), third_party: third,
                       // A zero or absent status is a request that never got an
                       // answer — refused, blocked by CORS, DNS gone. Those are
                       // the ones that leave the screen emptiest.
@@ -1547,6 +1908,8 @@ def browser_operation(request):
                 # page misbehaving rather than the driver.
                 held = modifier_mask(action.get("modifiers"))
                 pressed = []
+                ritmo = pace()
+                approach(call, x, y, ritmo)
                 try:
                     for name, code, bit in MODIFIERS:
                         if held & bit:
@@ -1585,6 +1948,11 @@ def browser_operation(request):
                 finally:
                     for name, code in reversed(pressed):
                         call("Input.dispatchKeyEvent", type="keyUp", key=name, code=code)
+                # Que la pantalla reaccione ANTES de seguir. En un video es lo
+                # que deja ver el efecto del clic; en un recorrido rapido no
+                # cuesta nada porque vale cero.
+                if ritmo["despues_del_clic"]:
+                    time.sleep(ritmo["despues_del_clic"])
                 if kind == "fill":
                     call(
                         "Input.dispatchKeyEvent",
@@ -1613,7 +1981,10 @@ def browser_operation(request):
                     # neither failure looks like a timing problem: one adds a
                     # line nobody asked for, the other returns the results of
                     # the previous query.
-                    per_key = float(request.get("key_delay", 0) or 0)
+                    # Lo que pida quien llama manda; si no pide nada, el ritmo
+                    # decide. Un punto de venta lee el compas del teclado, y un
+                    # video necesita que se pueda leer lo que se escribe.
+                    per_key = float(request.get("key_delay", 0) or 0) or pace()["por_tecla_ms"]
                     if per_key > 0:
                         for character in request["text"]:
                             call("Input.dispatchKeyEvent", type="keyDown", text=character,
@@ -1622,9 +1993,47 @@ def browser_operation(request):
                             time.sleep(per_key / 1000.0)
                     else:
                         call("Input.insertText", text=request["text"])
+                    # ── Salir del campo ───────────────────────────────────
+                    #
+                    # Una persona que rellena un formulario SIEMPRE sale del
+                    # campo: pulsa Tab, o hace clic en el siguiente. El motor no
+                    # lo hacia, y hay campos que solo confirman su valor al
+                    # salir — el componente guarda en `onBlur`, no en cada
+                    # pulsacion. El efecto es cruel: el valor se ve escrito en la
+                    # pantalla, pero el formulario no lo tiene, y al guardar
+                    # responde que ese campo obligatorio esta vacio. Quien mira
+                    # el video ve el numero puesto y un rechazo que no cuadra.
+                    #
+                    # Medido en la compra del ERP: el numero de control quedaba
+                    # escrito y el guardado lo rechazaba igual.
+                    #
+                    # NO se sale si hay un desplegable esperando. Un campo de
+                    # autocompletado acaba de abrir sus sugerencias, y salir las
+                    # cierra: se perderia justo el paso siguiente, que es
+                    # elegir una. Ahi el blur llega solo, cuando se pulsa la
+                    # sugerencia.
+                    call(
+                        "Runtime.evaluate",
+                        expression="""(node => {
+                          const el = window.__jevFast?.nodes.get(node);
+                          if (!el) return 'sin nodo';
+                          const abierto = el.getAttribute('aria-expanded') === 'true';
+                          const lista = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+                          const opciones = lista
+                            ? (document.getElementById(lista)?.querySelectorAll('[role="option"]').length || 0)
+                            : document.querySelectorAll('[role="listbox"] [role="option"]').length;
+                          if (abierto || opciones > 0) return 'desplegable abierto, no se sale';
+                          el.blur?.();
+                          return 'salido';
+                        })(""" + json.dumps(action["node"]) + ")",
+                        returnByValue=True,
+                    )
         return {"executed": action["id"]}
 
-    info = evaluate(READ_STATE)
+    scope, ignore = request.get("scope"), request.get("ignore")
+    # La constante cuando no se acota, para no recomponer el script en el caso
+    # normal; una expresion propia cuando si, con el alcance dentro.
+    info = evaluate(read_state_script(scope, ignore) if (scope or ignore) else READ_STATE)
     if info is None:
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)

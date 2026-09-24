@@ -71,7 +71,7 @@
   // document.querySelectorAll does not cross that boundary. On an app built
   // from them the agent sees an empty page: measured on a data grid, 0 rows
   // visible where the DOM had 13. It cannot click what it cannot see.
-  const crossRoots=(selector)=>{
+  const crossRootsFrom=(start,selector)=>{
     const found=[], seen=new Set();
     const walk=(root)=>{
       if (!root || seen.has(root)) return;
@@ -89,8 +89,34 @@
         if (inner) walk(inner);
       }
     };
-    walk(document);
+    walk(start);
     return found;
+  };
+  // ── Acotar la observacion ─────────────────────────────────────────────
+  //
+  // Una pantalla de ERP tiene cabecera, menu lateral, pestanas del modulo y la
+  // rejilla. Cuando el trabajo esta en la rejilla, los otros doscientos
+  // controles no son contexto: son opciones que no pueden ser correctas,
+  // compitiendo por el tope y por la atencion de quien decide. Acotar no es una
+  // optimizacion de tamano, es quitarlas de la mesa.
+  const SCOPE=typeof window.__jevScope==='string' && window.__jevScope.trim()
+    ? window.__jevScope.trim() : null;
+  const IGNORE=(Array.isArray(window.__jevIgnore) ? window.__jevIgnore : [])
+    .filter(s=>typeof s==='string' && s.trim()).map(s=>s.trim());
+  const IGNORE_SELECTOR=IGNORE.join(',');
+  let scopeNode=null;
+  if (SCOPE) { try { scopeNode=crossRootsFrom(document,SCOPE)[0] || null; } catch { scopeNode=null; } }
+  // Pedir una parte y recibir la pantalla entera EN SILENCIO es peor que no
+  // poder acotar: el recorrido decide sobre algo distinto de lo que cree, y no
+  // hay nada en la salida que lo delate. Si el contenedor no esta se observa
+  // todo, y se dice.
+  const scope_missing=!!SCOPE && !scopeNode;
+  const scopeRoot=scopeNode || document;
+  const crossRoots=(selector)=>{
+    const found=crossRootsFrom(scopeRoot,selector);
+    return IGNORE_SELECTOR ? found.filter(e=>{
+      try { return !closestDeep(e,IGNORE_SELECTOR); } catch { return true; }
+    }) : found;
   };
   // Half of an application is not built from buttons. A card, a row, a tile or
   // a chip is a div with a click handler: no role, no tabindex, nothing the
@@ -157,7 +183,9 @@
     return found.sort((a,b)=>(a.r.width*a.r.height)-(b.r.width*b.r.height)).slice(0,MAX_SCROLLERS);
   };
   const textRoots=()=>{
-    const roots=[document.body], seen=new Set();
+    // El texto tambien se acota: leer la cabecera y el menu cuando se pidio la
+    // rejilla es la misma confusion que ofrecer sus botones.
+    const roots=[scopeNode || document.body], seen=new Set();
     const walk=(root)=>{
       if (!root || seen.has(root)) return;
       seen.add(root);
@@ -170,7 +198,7 @@
         if (inner?.body) { roots.push(inner.body); walk(inner); }
       }
     };
-    walk(document);
+    walk(scopeRoot);
     return roots;
   };
   const actions=[];
@@ -265,6 +293,48 @@
     }
     const base={node:identity(e),role:rname,label,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    // ── Lo que la pagina DECLARA sobre este campo ─────────────────────────
+    //
+    // Un agente que no lee esto tiene que descubrir las obligaciones fallando:
+    // rellena lo que ve, guarda, le rechazan, vuelve. Y a veces ni eso — el
+    // rechazo llega como un aviso que no sabe relacionar con un campo, y se
+    // queda reintentando OTRA cosa. Visto en una compra del ERP: sesenta pasos
+    // repitiendo el selector de proveedor porque lo que faltaba era un numero de
+    // control que nadie le habia dicho que era obligatorio.
+    //
+    // La alternativa es escribir un caso a mano por pantalla, y eso no escala a
+    // "operar cualquier web": en cuanto sales de las pantallas preparadas, el
+    // agente vuelve a estar ciego.
+    //
+    // Nada de esto se inventa. Son las mismas senales que usa un lector de
+    // pantalla y que el navegador ya valida por su cuenta: el atributo del HTML,
+    // el ARIA que el autor puso, y el mensaje que el propio navegador daria.
+    const declarado = {};
+    if (e.required || e.getAttribute('aria-required') === 'true') declarado.obligatorio = true;
+    if (e.getAttribute('aria-invalid') === 'true') declarado.invalido = true;
+    // `validity` es la validacion del navegador, que ya sabe si un email no es un
+    // email o si falta un campo requerido — sin que nadie escriba una regla.
+    try {
+      if (e.validity && !e.validity.valid) {
+        declarado.invalido = true;
+        if (e.validationMessage) declarado.porque = e.validationMessage.slice(0, 120);
+      }
+    } catch {}
+    const dicho = textOf(e.getAttribute('aria-errormessage')) || textOf(e.getAttribute('aria-describedby'));
+    // El mensaje del autor manda sobre el del navegador: es el que explica la
+    // regla de negocio, no solo que el formato no cuadra.
+    if (dicho) declarado.porque = dicho.slice(0, 160);
+    for (const [attr, clave] of [['pattern','patron'], ['maxlength','maximo'],
+                                 ['minlength','minimo'], ['min','desde'], ['max','hasta'],
+                                 ['inputmode','teclado'], ['placeholder','ejemplo']]) {
+      const v = e.getAttribute(attr);
+      if (v) declarado[clave] = String(v).slice(0, 80);
+    }
+    // `title` en un campo con patron es, por convencion, la explicacion del
+    // formato que se espera. Sin patron suele ser una ayuda cualquiera.
+    if (e.getAttribute('pattern') && e.title) declarado.formato = e.title.slice(0, 120);
+    if (e.type && !['text','button','submit'].includes(e.type)) declarado.tipo = e.type;
+    if (Object.keys(declarado).length) base.declarado = declarado;
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -415,8 +485,42 @@
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     document.title,text,semantics,page_key[6]];
-  const omitted_actions=Math.max(0,actions.length-MAX_ACTIONS);
-  actions.splice(MAX_ACTIONS);
+  // ── El tope no se puede comer el paso siguiente ───────────────────────
+  //
+  // El tope existe para una tabla densa, donde recoger mil celdas no ayuda a
+  // nadie. Las opciones de un desplegable abierto son otra cosa: son el UNICO
+  // paso que continua lo que se acaba de escribir. Y son las ultimas en
+  // recogerse, porque un autocompletado se pinta en un portal al final del
+  // documento — de modo que en una pantalla con muchos controles son
+  // exactamente lo que el tope descarta.
+  //
+  // Medido: el campo queda escrito, ninguna sugerencia ofrecida, y el recorrido
+  // se para a un clic del final diciendo que no puede seguir. Es el fallo que
+  // se vio en las aptitudes y el sector de LinkedIn, que no tenia nada que ver
+  // con no saber elegir una sugerencia: no se le ofrecia ninguna.
+  const openCombobox=[...crossRoots('[aria-expanded="true"]')].some(
+    e=>e.getAttribute('role')==='combobox' || e.hasAttribute('aria-autocomplete'));
+  const urgent=[], rest=[];
+  for (const a of actions) {
+    let emergent=false;
+    if (a.role==='option') {
+      // Con un combobox declarado abierto basta. Si no lo declara —que pasa, y
+      // mas de lo que deberia— sirve la senal que el autor ya le dio al
+      // usuario: un desplegable emergente se pinta flotando, no en el flujo.
+      if (openCombobox) emergent=true;
+      else {
+        const e=cache.nodes.get(a.node);
+        const box=e && (closestDeep(e,'[role="listbox"],[role="menu"]') || e.parentElement);
+        emergent=!!box && ['absolute','fixed'].includes(getComputedStyle(box).position);
+      }
+    }
+    (emergent ? urgent : rest).push(a);
+  }
+  const ordered=[...urgent,...rest];
+  const omitted_actions=Math.max(0,ordered.length-MAX_ACTIONS);
+  ordered.splice(MAX_ACTIONS);
+  actions.length=0;
+  actions.push(...ordered);
   actions.forEach((a,i)=>a.id='e'+(i+1));
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
@@ -446,5 +550,8 @@
   }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,blocked,keys,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,blocked,keys,marker,page_key,guards,omitted_actions,
+    // Que se observo, no solo lo observado. Una observacion parcial que no se
+    // declara es una observacion que miente por omision.
+    scope:SCOPE,scope_missing,ignored:IGNORE};
 })()
